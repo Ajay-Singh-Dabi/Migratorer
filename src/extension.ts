@@ -7,7 +7,7 @@ export function activate(context: vscode.ExtensionContext): void {
   // Register main command
   context.subscriptions.push(
     vscode.commands.registerCommand('migrationAssistant.open', () => {
-      MigrationPanel.createOrShow(context.extensionUri);
+      MigrationPanel.createOrShow(context);
     })
   );
 

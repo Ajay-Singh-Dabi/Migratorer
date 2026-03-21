@@ -35,8 +35,70 @@ var __importStar = (this && this.__importStar) || (function () {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.parseGitHubUrl = parseGitHubUrl;
 exports.analyzeRepository = analyzeRepository;
+exports.parseOrgUrl = parseOrgUrl;
+exports.analyzeOrg = analyzeOrg;
+exports.fetchBranchDiff = fetchBranchDiff;
 const https = __importStar(require("https"));
 const vscode = __importStar(require("vscode"));
+// ─── Secret Redaction ─────────────────────────────────────────────────────────
+// Files that must never be fetched — too likely to contain raw secrets
+const BLOCKED_FILE_PATTERNS = [
+    /^\.env(\..+)?$/, // .env, .env.local, .env.production
+    /\.pem$/i, // TLS certificates / private keys
+    /\.key$/i, // private key files
+    /\.pfx$/i, // PKCS#12 keystores
+    /\.p12$/i,
+    /\.jks$/i, // Java keystores
+    /^secrets?\.(json|yaml|yml|toml)$/i, // secrets files
+    /^credentials?(\.json)?$/i, // credentials files
+    /private[-_]?key/i, // anything named private-key
+    /\.kubeconfig$/i,
+    /^terraform\.tfvars$/i, // Terraform variable files (often have secrets)
+];
+// Patterns that match common secret formats inside file content
+const SECRET_PATTERNS = [
+    { pattern: /(['"]?(?:password|passwd|pwd)['"]?\s*[:=]\s*)(['"][^'"]{3,}['"]|\S{6,})/gi, label: 'password' },
+    { pattern: /(['"]?(?:api[_-]?key|apikey)['"]?\s*[:=]\s*)(['"][^'"]{8,}['"]|\S{8,})/gi, label: 'API key' },
+    { pattern: /(['"]?(?:secret|client[_-]?secret)['"]?\s*[:=]\s*)(['"][^'"]{8,}['"]|\S{8,})/gi, label: 'secret' },
+    { pattern: /(['"]?(?:auth[_-]?token|access[_-]?token)['"]?\s*[:=]\s*)(['"][^'"]{8,}['"]|\S{8,})/gi, label: 'token' },
+    { pattern: /(Bearer\s+)[A-Za-z0-9\-._~+/]{20,}/gi, label: 'Bearer token' },
+    { pattern: /ghp_[A-Za-z0-9]{36}/g, label: 'GitHub token' },
+    { pattern: /gho_[A-Za-z0-9]{36}/g, label: 'GitHub OAuth token' },
+    { pattern: /ghu_[A-Za-z0-9]{36}/g, label: 'GitHub user token' },
+    { pattern: /ghs_[A-Za-z0-9]{36}/g, label: 'GitHub server token' },
+    { pattern: /AKIA[0-9A-Z]{16}/g, label: 'AWS access key' },
+    { pattern: /(?:aws[_-]?secret[_-]?access[_-]?key\s*=\s*)[A-Za-z0-9/+=]{40}/gi, label: 'AWS secret' },
+    { pattern: /-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/gi, label: 'private key block' },
+    { pattern: /(?:postgres|mysql|mongodb|redis):\/\/[^:]+:[^@\s]{3,}@/gi, label: 'connection string with password' },
+    { pattern: /(?:https?:\/\/)[^:]+:[^@\s]{3,}@/gi, label: 'URL with embedded credentials' },
+    { pattern: /(['"]?private[_-]?key['"]?\s*[:=]\s*)(['"][^'"]{8,}['"])/gi, label: 'private key value' },
+    { pattern: /(['"]?(?:encryption|signing)[_-]?key['"]?\s*[:=]\s*)(['"][^'"]{8,}['"])/gi, label: 'encryption key' },
+    { pattern: /(?:eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,})/g, label: 'JWT token' },
+    { pattern: /AIza[0-9A-Za-z\-_]{35}/g, label: 'Google API key' },
+    { pattern: /SG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}/g, label: 'SendGrid API key' },
+    { pattern: /sk-[A-Za-z0-9]{48}/g, label: 'OpenAI API key' },
+];
+function isBlockedFile(filePath) {
+    const filename = filePath.split('/').pop() || filePath;
+    return BLOCKED_FILE_PATTERNS.some((p) => p.test(filename) || p.test(filePath));
+}
+function redactSecrets(content) {
+    let out = content;
+    let count = 0;
+    for (const { pattern, label } of SECRET_PATTERNS) {
+        // Reset lastIndex for global patterns (safety)
+        pattern.lastIndex = 0;
+        out = out.replace(pattern, (match, ...groups) => {
+            count++;
+            // For patterns with a prefix capture group, keep the prefix, redact only the value
+            if (groups.length >= 2 && typeof groups[0] === 'string' && groups[0].length > 0 && groups[0].length < match.length) {
+                return `${groups[0]}[REDACTED:${label}]`;
+            }
+            return `[REDACTED:${label}]`;
+        });
+    }
+    return { redacted: out, count };
+}
 // ─── GitHub API Helper ────────────────────────────────────────────────────────
 // Builds the correct API base path:
 //   github.com          → hostname: api.github.com,        path: /repos/...
@@ -148,6 +210,64 @@ async function fetchFileContent(owner, repo, path, token, hostname = 'github.com
     catch {
         return null;
     }
+}
+// ─── .migrationignore Support ────────────────────────────────────────────────
+function parseMigrationIgnore(content) {
+    return content
+        .split('\n')
+        .map((l) => l.trim())
+        .filter((l) => l && !l.startsWith('#'))
+        .map((pattern) => {
+        // Convert glob-style to regex (basic support)
+        const escaped = pattern
+            .replace(/[.+^${}()|[\]\\]/g, '\\$&')
+            .replace(/\*/g, '.*')
+            .replace(/\?/g, '.');
+        return new RegExp(`(^|/)${escaped}($|/)`);
+    });
+}
+function isIgnoredByMigrationIgnore(filePath, ignoreRules) {
+    return ignoreRules.some((rule) => rule.test(filePath));
+}
+// ─── Source Code Entry Point Detection ───────────────────────────────────────
+const SOURCE_ENTRY_PATTERNS = [
+    // Node / TypeScript
+    { pattern: /^src\/(index|app|main|server)\.(ts|js)$/, priority: 1 },
+    { pattern: /^(index|app|main|server)\.(ts|js)$/, priority: 2 },
+    // Routes / controllers (first match only)
+    { pattern: /^src\/(routes?|controllers?|api)\/(index|main)\.(ts|js)$/, priority: 3 },
+    { pattern: /^src\/routes?\.(ts|js)$/, priority: 3 },
+    // Python
+    { pattern: /^(main|app|run|wsgi|asgi|manage)\.py$/, priority: 1 },
+    { pattern: /^src\/(main|app)\.py$/, priority: 2 },
+    // Java / Kotlin — application entry points
+    { pattern: /Application\.(java|kt)$/, priority: 1 },
+    { pattern: /Main\.(java|kt)$/, priority: 2 },
+    // Go
+    { pattern: /^(main\.go|cmd\/[^/]+\/main\.go)$/, priority: 1 },
+    // Rust
+    { pattern: /^src\/(main|lib)\.rs$/, priority: 1 },
+    // Ruby
+    { pattern: /^(app\.rb|config\.ru|Rakefile)$/, priority: 1 },
+    // PHP
+    { pattern: /^(index|app)\.php$/, priority: 1 },
+    // Config as source context
+    { pattern: /^src\/config\.(ts|js|py)$/, priority: 4 },
+];
+function findSourceEntryPoints(fileTree, maxFiles = 5) {
+    const scored = [];
+    for (const filePath of fileTree) {
+        for (const { pattern, priority } of SOURCE_ENTRY_PATTERNS) {
+            if (pattern.test(filePath)) {
+                scored.push({ path: filePath, priority });
+                break;
+            }
+        }
+    }
+    return scored
+        .sort((a, b) => a.priority - b.priority)
+        .slice(0, maxFiles)
+        .map((s) => s.path);
 }
 // ─── Key Files to Detect ─────────────────────────────────────────────────────
 const KEY_FILE_PATTERNS = [
@@ -451,36 +571,61 @@ function detectStack(keyFiles, fileTree, repoLanguage) {
 }
 // ─── Main Analyzer ────────────────────────────────────────────────────────────
 async function analyzeRepository(repoUrl, token, onProgress) {
-    const STEPS = 4;
+    const STEPS = 5;
     onProgress('Parsing repository URL…', 1, STEPS);
     const { owner, repo, hostname } = parseGitHubUrl(repoUrl);
     onProgress(`Fetching repository info for ${owner}/${repo} on ${hostname}…`, 2, STEPS);
     const repoInfo = await fetchRepoInfo(owner, repo, token, hostname);
     onProgress('Loading file tree…', 3, STEPS);
     const fileTree = await fetchFileTree(owner, repo, repoInfo.defaultBranch, token, hostname);
-    onProgress('Reading key configuration files…', 4, STEPS);
-    // Find which key files exist in this repo
-    const existingKeyFiles = KEY_FILE_PATTERNS.filter((kf) => fileTree.includes(kf.path));
+    // ── .migrationignore support ───────────────────────────────────────────────
+    const migrationIgnoreRaw = await fetchFileContent(owner, repo, '.migrationignore', token, hostname);
+    const ignoreRules = migrationIgnoreRaw ? parseMigrationIgnore(migrationIgnoreRaw) : [];
+    onProgress('Reading config and source files…', 4, STEPS);
+    // Find which key config files exist in this repo
+    const existingKeyFiles = KEY_FILE_PATTERNS.filter((kf) => fileTree.includes(kf.path) && !isIgnoredByMigrationIgnore(kf.path, ignoreRules));
     // Also find CI workflows
-    const ciWorkflows = fileTree.filter((f) => f.startsWith('.github/workflows/') && f.endsWith('.yml')).slice(0, 2);
+    const ciWorkflows = fileTree.filter((f) => f.startsWith('.github/workflows/') && f.endsWith('.yml') && !isIgnoredByMigrationIgnore(f, ignoreRules)).slice(0, 2);
+    // Source entry points (enhancement #1)
+    const sourceEntryPoints = findSourceEntryPoints(fileTree).filter((p) => !isIgnoredByMigrationIgnore(p, ignoreRules));
     const allToFetch = [
         ...existingKeyFiles,
         ...ciWorkflows
             .filter((p) => !existingKeyFiles.some((kf) => kf.path === p))
             .map((p) => ({ path: p, type: 'ci' })),
+        ...sourceEntryPoints
+            .filter((p) => !existingKeyFiles.some((kf) => kf.path === p))
+            .map((p) => ({ path: p, type: 'source' })),
     ];
+    onProgress(`Fetching ${allToFetch.length} files and scanning for secrets…`, 5, STEPS);
+    const skippedFiles = [];
+    const filesWithSecrets = [];
+    let totalRedactions = 0;
     const keyFiles = (await Promise.all(allToFetch.map(async ({ path, type }) => {
-        const content = await fetchFileContent(owner, repo, path, token, hostname);
-        if (!content) {
+        // Block sensitive files entirely — never fetch them
+        if (isBlockedFile(path)) {
+            skippedFiles.push(path);
             return null;
         }
-        // Truncate very large files
-        return {
-            path,
-            type,
-            content: content.length > 8000 ? content.slice(0, 8000) + '\n... (truncated)' : content,
-        };
+        const raw = await fetchFileContent(owner, repo, path, token, hostname);
+        if (!raw) {
+            return null;
+        }
+        // Truncate before redacting to keep the operation bounded
+        const truncated = raw.length > 8000 ? raw.slice(0, 8000) + '\n... (truncated)' : raw;
+        // Redact secrets from the content
+        const { redacted, count } = redactSecrets(truncated);
+        if (count > 0) {
+            filesWithSecrets.push(path);
+            totalRedactions += count;
+        }
+        return { path, type, content: redacted, redactedCount: count };
     }))).filter((f) => f !== null);
+    const redactionSummary = {
+        totalRedactions,
+        filesWithSecrets,
+        skippedFiles,
+    };
     const detectedStack = detectStack(keyFiles, fileTree, repoInfo.language);
     return {
         repoInfo,
@@ -488,6 +633,101 @@ async function analyzeRepository(repoUrl, token, onProgress) {
         keyFiles,
         fileTree,
         totalFiles: fileTree.length,
+        redactionSummary,
+    };
+}
+// ─── Org Dashboard Analyzer (enhancement #7) ─────────────────────────────────
+function parseOrgUrl(url) {
+    const cleaned = url.trim().replace(/\/$/, '');
+    const match = cleaned.match(/https?:\/\/([\w.-]+)\/([\w.-]+)$/);
+    if (!match) {
+        throw new Error(`Invalid org URL: "${url}"\nExpected: https://github.com/myorg`);
+    }
+    return { hostname: match[1], org: match[2] };
+}
+async function analyzeOrg(orgUrl, token, onProgress) {
+    const { hostname, org } = parseOrgUrl(orgUrl);
+    onProgress(`Fetching repos for ${org}…`, 0, 1);
+    // Fetch up to 100 repos (GitHub API default page size)
+    const data = await githubGet(`/orgs/${org}/repos?per_page=100&sort=updated`, token, hostname)
+        .catch(() => githubGet(`/users/${org}/repos?per_page=100&sort=updated`, token, hostname));
+    const repos = [];
+    const total = Math.min((data || []).length, 50); // cap at 50
+    for (let i = 0; i < total; i++) {
+        const r = data[i];
+        onProgress(`Scanning ${r.name} (${i + 1}/${total})…`, i + 1, total);
+        // Quick-fetch package.json or pom.xml to estimate stack
+        let detectedStack = r.language || 'Unknown';
+        let complexity = 'Unknown';
+        try {
+            const pkg = await fetchFileContent(r.owner.login, r.name, 'package.json', token, hostname);
+            if (pkg) {
+                const parsed = JSON.parse(pkg);
+                const deps = { ...parsed.dependencies, ...parsed.devDependencies };
+                if (deps['next']) {
+                    detectedStack = 'Next.js';
+                }
+                else if (deps['react']) {
+                    detectedStack = 'React';
+                }
+                else if (deps['vue']) {
+                    detectedStack = 'Vue';
+                }
+                else if (deps['@angular/core']) {
+                    detectedStack = 'Angular';
+                }
+                else if (deps['express']) {
+                    detectedStack = 'Express';
+                }
+                else if (deps['@nestjs/core']) {
+                    detectedStack = 'NestJS';
+                }
+                else {
+                    detectedStack = 'Node.js';
+                }
+                const depCount = Object.keys(deps).length;
+                complexity = depCount < 20 ? 'Low' : depCount < 60 ? 'Medium' : 'High';
+            }
+            else {
+                const pom = await fetchFileContent(r.owner.login, r.name, 'pom.xml', token, hostname);
+                if (pom) {
+                    detectedStack = pom.includes('spring-boot') ? 'Spring Boot' : 'Java/Maven';
+                    complexity = 'Medium';
+                }
+            }
+        }
+        catch { /* skip */ }
+        repos.push({
+            name: r.name,
+            fullName: r.full_name,
+            description: r.description || '',
+            language: r.language || 'Unknown',
+            stars: r.stargazers_count || 0,
+            size: r.size || 0,
+            defaultBranch: r.default_branch || 'main',
+            updatedAt: r.updated_at || '',
+            detectedStack,
+            complexity,
+        });
+    }
+    return { org, hostname, totalRepos: data.length, repos };
+}
+// ─── Branch Diff Fetcher (enhancement #8) ─────────────────────────────────────
+async function fetchBranchDiff(owner, repo, baseBranch, compareBranch, token, hostname = 'github.com') {
+    const data = await githubGet(`/repos/${owner}/${repo}/compare/${baseBranch}...${compareBranch}`, token, hostname);
+    const changedFiles = (data.files || []).map((f) => f.filename);
+    // Build a diff sample from the first few files
+    const diffSample = (data.files || [])
+        .slice(0, 5)
+        .map((f) => `### ${f.filename}\n+${f.additions} -${f.deletions}\n${(f.patch || '').slice(0, 500)}`)
+        .join('\n\n');
+    return {
+        baseBranch,
+        compareBranch,
+        changedFiles,
+        additions: data.ahead_by || 0,
+        deletions: data.behind_by || 0,
+        diffSample: diffSample.slice(0, 6000),
     };
 }
 //# sourceMappingURL=githubAnalyzer.js.map

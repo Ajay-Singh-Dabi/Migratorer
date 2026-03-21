@@ -41,7 +41,7 @@ function activate(context) {
     console.log('Code Migration Assistant activated');
     // Register main command
     context.subscriptions.push(vscode.commands.registerCommand('migrationAssistant.open', () => {
-        migrationPanel_1.MigrationPanel.createOrShow(context.extensionUri);
+        migrationPanel_1.MigrationPanel.createOrShow(context);
     }));
     // Register clear history command
     context.subscriptions.push(vscode.commands.registerCommand('migrationAssistant.clearHistory', () => {

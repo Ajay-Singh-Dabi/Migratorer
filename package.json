@@ -51,6 +51,11 @@
           "type": "number",
           "default": 20,
           "description": "Maximum number of files to read for deep analysis"
+        },
+        "migrationAssistant.maskOrgPackages": {
+          "type": "boolean",
+          "default": true,
+          "description": "Replace private org-scoped package names (e.g. @myorg/pkg) with [masked-package] before sending to Copilot"
         }
       }
     }
@@ -59,6 +64,9 @@
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
     "vscode:prepublish": "npm run compile"
+  },
+  "dependencies": {
+    "docx": "^8.5.0"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
