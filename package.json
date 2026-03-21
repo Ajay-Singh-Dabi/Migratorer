@@ -1,0 +1,68 @@
+{
+  "name": "code-migration-assistant",
+  "displayName": "Code Migration Assistant",
+  "description": "Analyze any GitHub repo and get AI-powered modernization suggestions via GitHub Copilot",
+  "version": "1.0.0",
+  "publisher": "migration-tools",
+  "engines": { "vscode": "^1.90.0" },
+  "categories": ["Other", "Programming Languages"],
+  "keywords": ["migration", "modernization", "copilot", "refactor", "upgrade"],
+  "activationEvents": [],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "migrationAssistant.open",
+        "title": "Migration Assistant: Open Panel",
+        "icon": "$(rocket)"
+      },
+      {
+        "command": "migrationAssistant.clearHistory",
+        "title": "Migration Assistant: Clear History"
+      }
+    ],
+    "menus": {
+      "commandPalette": [
+        { "command": "migrationAssistant.open" },
+        { "command": "migrationAssistant.clearHistory" }
+      ],
+      "editor/title": [
+        {
+          "command": "migrationAssistant.open",
+          "group": "navigation"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Code Migration Assistant",
+      "properties": {
+        "migrationAssistant.githubToken": {
+          "type": "string",
+          "default": "",
+          "description": "GitHub Personal Access Token for accessing private repositories"
+        },
+        "migrationAssistant.copilotModel": {
+          "type": "string",
+          "default": "gpt-4o",
+          "enum": ["gpt-4o", "gpt-4", "gpt-3.5-turbo", "claude-3.5-sonnet"],
+          "description": "Copilot model to use for analysis"
+        },
+        "migrationAssistant.maxFilesToAnalyze": {
+          "type": "number",
+          "default": 20,
+          "description": "Maximum number of files to read for deep analysis"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "vscode:prepublish": "npm run compile"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.90.0",
+    "typescript": "^5.4.0"
+  }
+}
