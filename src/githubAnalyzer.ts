@@ -9,11 +9,23 @@ import {
 
 // ─── GitHub API Helper ────────────────────────────────────────────────────────
 
-function githubGet(path: string, token?: string): Promise<any> {
+// Builds the correct API base path:
+//   github.com          → hostname: api.github.com,        path: /repos/...
+//   github.example.com  → hostname: github.example.com,    path: /api/v3/repos/...
+function resolveApiTarget(hostname: string, path: string): { hostname: string; fullPath: string } {
+  if (hostname === 'github.com') {
+    return { hostname: 'api.github.com', fullPath: path };
+  }
+  // GitHub Enterprise Server
+  return { hostname, fullPath: `/api/v3${path}` };
+}
+
+function githubGet(path: string, token?: string, hostname = 'github.com'): Promise<any> {
   return new Promise((resolve, reject) => {
+    const { hostname: apiHost, fullPath } = resolveApiTarget(hostname, path);
     const options: https.RequestOptions = {
-      hostname: 'api.github.com',
-      path,
+      hostname: apiHost,
+      path: fullPath,
       method: 'GET',
       headers: {
         'User-Agent': 'vscode-migration-assistant/1.0',
@@ -56,22 +68,27 @@ function githubGet(path: string, token?: string): Promise<any> {
 
 // ─── URL Parser ───────────────────────────────────────────────────────────────
 
-export function parseGitHubUrl(url: string): { owner: string; repo: string } {
+export function parseGitHubUrl(url: string): { owner: string; repo: string; hostname: string } {
   const cleaned = url.trim()
     .replace(/\.git$/, '')
     .replace(/\/$/, '');
 
-  const match = cleaned.match(/github\.com[/:]([\w.-]+)\/([\w.-]+)/);
+  // Matches any GitHub host: github.com, github.company.com, etc.
+  const match = cleaned.match(/https?:\/\/([\w.-]+)\/([\w.-]+)\/([\w.-]+)/);
   if (!match) {
-    throw new Error(`Invalid GitHub URL: "${url}"\nExpected format: https://github.com/owner/repo`);
+    throw new Error(
+      `Invalid GitHub URL: "${url}"\n` +
+      `Expected format: https://github.com/owner/repo\n` +
+      `               or https://github.yourcompany.com/owner/repo`
+    );
   }
-  return { owner: match[1], repo: match[2] };
+  return { hostname: match[1], owner: match[2], repo: match[3] };
 }
 
 // ─── Fetch Repo Info ──────────────────────────────────────────────────────────
 
-async function fetchRepoInfo(owner: string, repo: string, token?: string): Promise<RepoInfo> {
-  const data = await githubGet(`/repos/${owner}/${repo}`, token);
+async function fetchRepoInfo(owner: string, repo: string, token?: string, hostname = 'github.com'): Promise<RepoInfo> {
+  const data = await githubGet(`/repos/${owner}/${repo}`, token, hostname);
   return {
     owner,
     repo,
@@ -85,11 +102,12 @@ async function fetchRepoInfo(owner: string, repo: string, token?: string): Promi
 
 // ─── Fetch File Tree ──────────────────────────────────────────────────────────
 
-async function fetchFileTree(owner: string, repo: string, branch: string, token?: string): Promise<string[]> {
+async function fetchFileTree(owner: string, repo: string, branch: string, token?: string, hostname = 'github.com'): Promise<string[]> {
   try {
     const data = await githubGet(
       `/repos/${owner}/${repo}/git/trees/${branch}?recursive=1`,
-      token
+      token,
+      hostname
     );
     if (data.truncated) {
       vscode.window.showWarningMessage('Repository is very large — file tree is truncated.');
@@ -99,7 +117,7 @@ async function fetchFileTree(owner: string, repo: string, branch: string, token?
       .map((item: any) => item.path as string);
   } catch {
     // Fallback: get root contents
-    const items = await githubGet(`/repos/${owner}/${repo}/contents`, token);
+    const items = await githubGet(`/repos/${owner}/${repo}/contents`, token, hostname);
     return (items || []).map((item: any) => item.path as string);
   }
 }
@@ -110,10 +128,11 @@ async function fetchFileContent(
   owner: string,
   repo: string,
   path: string,
-  token?: string
+  token?: string,
+  hostname = 'github.com'
 ): Promise<string | null> {
   try {
-    const data = await githubGet(`/repos/${owner}/${repo}/contents/${path}`, token);
+    const data = await githubGet(`/repos/${owner}/${repo}/contents/${path}`, token, hostname);
     if (data.content && data.encoding === 'base64') {
       return Buffer.from(data.content.replace(/\n/g, ''), 'base64').toString('utf-8');
     }
@@ -366,13 +385,13 @@ export async function analyzeRepository(
   const STEPS = 4;
 
   onProgress('Parsing repository URL…', 1, STEPS);
-  const { owner, repo } = parseGitHubUrl(repoUrl);
+  const { owner, repo, hostname } = parseGitHubUrl(repoUrl);
 
-  onProgress(`Fetching repository info for ${owner}/${repo}…`, 2, STEPS);
-  const repoInfo = await fetchRepoInfo(owner, repo, token);
+  onProgress(`Fetching repository info for ${owner}/${repo} on ${hostname}…`, 2, STEPS);
+  const repoInfo = await fetchRepoInfo(owner, repo, token, hostname);
 
   onProgress('Loading file tree…', 3, STEPS);
-  const fileTree = await fetchFileTree(owner, repo, repoInfo.defaultBranch, token);
+  const fileTree = await fetchFileTree(owner, repo, repoInfo.defaultBranch, token, hostname);
 
   onProgress('Reading key configuration files…', 4, STEPS);
 
@@ -396,7 +415,7 @@ export async function analyzeRepository(
   const keyFiles: KeyFile[] = (
     await Promise.all(
       allToFetch.map(async ({ path, type }) => {
-        const content = await fetchFileContent(owner, repo, path, token);
+        const content = await fetchFileContent(owner, repo, path, token, hostname);
         if (!content) { return null; }
         // Truncate very large files
         return {

@@ -38,11 +38,22 @@ exports.analyzeRepository = analyzeRepository;
 const https = __importStar(require("https"));
 const vscode = __importStar(require("vscode"));
 // ─── GitHub API Helper ────────────────────────────────────────────────────────
-function githubGet(path, token) {
+// Builds the correct API base path:
+//   github.com          → hostname: api.github.com,        path: /repos/...
+//   github.example.com  → hostname: github.example.com,    path: /api/v3/repos/...
+function resolveApiTarget(hostname, path) {
+    if (hostname === 'github.com') {
+        return { hostname: 'api.github.com', fullPath: path };
+    }
+    // GitHub Enterprise Server
+    return { hostname, fullPath: `/api/v3${path}` };
+}
+function githubGet(path, token, hostname = 'github.com') {
     return new Promise((resolve, reject) => {
+        const { hostname: apiHost, fullPath } = resolveApiTarget(hostname, path);
         const options = {
-            hostname: 'api.github.com',
-            path,
+            hostname: apiHost,
+            path: fullPath,
             method: 'GET',
             headers: {
                 'User-Agent': 'vscode-migration-assistant/1.0',
@@ -86,15 +97,18 @@ function parseGitHubUrl(url) {
     const cleaned = url.trim()
         .replace(/\.git$/, '')
         .replace(/\/$/, '');
-    const match = cleaned.match(/github\.com[/:]([\w.-]+)\/([\w.-]+)/);
+    // Matches any GitHub host: github.com, github.company.com, etc.
+    const match = cleaned.match(/https?:\/\/([\w.-]+)\/([\w.-]+)\/([\w.-]+)/);
     if (!match) {
-        throw new Error(`Invalid GitHub URL: "${url}"\nExpected format: https://github.com/owner/repo`);
+        throw new Error(`Invalid GitHub URL: "${url}"\n` +
+            `Expected format: https://github.com/owner/repo\n` +
+            `               or https://github.yourcompany.com/owner/repo`);
     }
-    return { owner: match[1], repo: match[2] };
+    return { hostname: match[1], owner: match[2], repo: match[3] };
 }
 // ─── Fetch Repo Info ──────────────────────────────────────────────────────────
-async function fetchRepoInfo(owner, repo, token) {
-    const data = await githubGet(`/repos/${owner}/${repo}`, token);
+async function fetchRepoInfo(owner, repo, token, hostname = 'github.com') {
+    const data = await githubGet(`/repos/${owner}/${repo}`, token, hostname);
     return {
         owner,
         repo,
@@ -106,9 +120,9 @@ async function fetchRepoInfo(owner, repo, token) {
     };
 }
 // ─── Fetch File Tree ──────────────────────────────────────────────────────────
-async function fetchFileTree(owner, repo, branch, token) {
+async function fetchFileTree(owner, repo, branch, token, hostname = 'github.com') {
     try {
-        const data = await githubGet(`/repos/${owner}/${repo}/git/trees/${branch}?recursive=1`, token);
+        const data = await githubGet(`/repos/${owner}/${repo}/git/trees/${branch}?recursive=1`, token, hostname);
         if (data.truncated) {
             vscode.window.showWarningMessage('Repository is very large — file tree is truncated.');
         }
@@ -118,14 +132,14 @@ async function fetchFileTree(owner, repo, branch, token) {
     }
     catch {
         // Fallback: get root contents
-        const items = await githubGet(`/repos/${owner}/${repo}/contents`, token);
+        const items = await githubGet(`/repos/${owner}/${repo}/contents`, token, hostname);
         return (items || []).map((item) => item.path);
     }
 }
 // ─── Fetch File Content ───────────────────────────────────────────────────────
-async function fetchFileContent(owner, repo, path, token) {
+async function fetchFileContent(owner, repo, path, token, hostname = 'github.com') {
     try {
-        const data = await githubGet(`/repos/${owner}/${repo}/contents/${path}`, token);
+        const data = await githubGet(`/repos/${owner}/${repo}/contents/${path}`, token, hostname);
         if (data.content && data.encoding === 'base64') {
             return Buffer.from(data.content.replace(/\n/g, ''), 'base64').toString('utf-8');
         }
@@ -439,11 +453,11 @@ function detectStack(keyFiles, fileTree, repoLanguage) {
 async function analyzeRepository(repoUrl, token, onProgress) {
     const STEPS = 4;
     onProgress('Parsing repository URL…', 1, STEPS);
-    const { owner, repo } = parseGitHubUrl(repoUrl);
-    onProgress(`Fetching repository info for ${owner}/${repo}…`, 2, STEPS);
-    const repoInfo = await fetchRepoInfo(owner, repo, token);
+    const { owner, repo, hostname } = parseGitHubUrl(repoUrl);
+    onProgress(`Fetching repository info for ${owner}/${repo} on ${hostname}…`, 2, STEPS);
+    const repoInfo = await fetchRepoInfo(owner, repo, token, hostname);
     onProgress('Loading file tree…', 3, STEPS);
-    const fileTree = await fetchFileTree(owner, repo, repoInfo.defaultBranch, token);
+    const fileTree = await fetchFileTree(owner, repo, repoInfo.defaultBranch, token, hostname);
     onProgress('Reading key configuration files…', 4, STEPS);
     // Find which key files exist in this repo
     const existingKeyFiles = KEY_FILE_PATTERNS.filter((kf) => fileTree.includes(kf.path));
@@ -456,7 +470,7 @@ async function analyzeRepository(repoUrl, token, onProgress) {
             .map((p) => ({ path: p, type: 'ci' })),
     ];
     const keyFiles = (await Promise.all(allToFetch.map(async ({ path, type }) => {
-        const content = await fetchFileContent(owner, repo, path, token);
+        const content = await fetchFileContent(owner, repo, path, token, hostname);
         if (!content) {
             return null;
         }
