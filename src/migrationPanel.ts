@@ -9,6 +9,15 @@ import {
   streamProgressCheck,
   streamExportFormat,
   streamDetailedReport,
+  streamStackRecommendations,
+  streamStackHealthAnalysis,
+  detectStackWithAI,
+  streamChatReply,
+  detectStackChangeIntent,
+  streamPlanPatch,
+  generatePresets,
+  getAvailableModels,
+  streamJiraStories,
 } from './copilotService';
 import { generateWordReport, generateHtmlReport } from './reportGenerator';
 import {
@@ -18,6 +27,10 @@ import {
   AnalysisOptions,
   CachedAnalysis,
   HistoryEntry,
+  ChatMessage,
+  StackChangeIntent,
+  JiraStory,
+  JiraStoriesConfig,
 } from './types';
 
 const CACHE_KEY    = 'migrationAssistant.analysisCache';
@@ -39,6 +52,8 @@ export class MigrationPanel {
   private _cancellationSource?: vscode.CancellationTokenSource;
   private _lastAnalysis?: RepoAnalysis;
   private _lastPlan = '';
+  private _chatHistory: ChatMessage[] = [];
+  private _pendingStackChange?: StackChangeIntent;
 
   // ─── Static Factory ──────────────────────────────────────────────────────────
 
@@ -80,7 +95,11 @@ export class MigrationPanel {
     this._panel.onDidDispose(() => this.dispose(), null, this._disposables);
 
     this._panel.webview.onDidReceiveMessage(
-      (msg: WebviewMessage) => this._handleMessage(msg),
+      (msg: WebviewMessage) => {
+        this._handleMessage(msg).catch((err: any) => {
+          this._post({ type: 'error', message: `Internal error: ${err?.message ?? String(err)}` });
+        });
+      },
       null,
       this._disposables
     );
@@ -93,6 +112,10 @@ export class MigrationPanel {
       case 'ready':
         await this._sendSettings();
         this._post({ type: 'historyLoaded', entries: this._getHistory() });
+        // Populate model dropdown with live Copilot models
+        getAvailableModels().then(models => {
+          if (models.length > 0) { this._post({ type: 'modelsLoaded', models }); }
+        }).catch(() => { /* silently ignore — static fallback options remain */ });
         break;
 
       case 'analyze':
@@ -124,7 +147,7 @@ export class MigrationPanel {
         break;
 
       case 'validateToken':
-        await this._validateToken(msg.githubToken);
+        await this._validateToken(msg.githubToken, msg.repoUrl);
         break;
 
       case 'savePlan':
@@ -186,6 +209,37 @@ export class MigrationPanel {
         await this._generateReport(msg.targetStack!, msg.reportFormat ?? 'word');
         break;
 
+      case 'generateJiraStories':
+        await this._generateJiraStories(msg.targetStack!, msg.jiraConfig!);
+        break;
+
+      case 'recommendStacks':
+        await this._runStackRecommendations();
+        break;
+
+      case 'analyzeStackHealth':
+        await this._runStackHealthAnalysis();
+        break;
+
+      case 'aiDetectStack':
+        await this._runAIStackDetection();
+        break;
+
+      case 'chat':
+        await this._runChat(msg.chatMessage ?? '');
+        break;
+
+      case 'clearChat':
+        this._chatHistory = [];
+        this._pendingStackChange = undefined;
+        this._post({ type: 'chatCleared' });
+        break;
+
+      // User confirmed they want to apply the detected stack swap to the plan
+      case 'applyStackChange':
+        await this.applyPendingPlanPatch();
+        break;
+
       case 'openSettings':
         vscode.commands.executeCommand('workbench.action.openSettings', 'migrationAssistant');
         break;
@@ -220,6 +274,7 @@ export class MigrationPanel {
       this._lastAnalysis = cached.analysis;
       this._post({ type: 'analysisComplete', analysis: cached.analysis });
       this._post({ type: 'cacheHit', cachedAt: cached.timestamp });
+      this._generateAndPostPresets(cached.analysis);
       return;
     }
 
@@ -235,9 +290,24 @@ export class MigrationPanel {
       this._setCachedAnalysis(repoUrl, analysis);
       this._lastAnalysis = analysis;
       this._post({ type: 'analysisComplete', analysis });
+      this._generateAndPostPresets(analysis);
     } catch (err: any) {
       this._post({ type: 'error', message: err.message || String(err) });
     }
+  }
+
+  /** Fire-and-forget: generate AI presets and send them to the webview. */
+  private _generateAndPostPresets(analysis: RepoAnalysis): void {
+    const cts = new vscode.CancellationTokenSource();
+    generatePresets(analysis, cts.token)
+      .then((presets) => {
+        this._post({ type: 'presetsReady', presets });
+      })
+      .catch(() => {
+        // Preset generation is best-effort — fall back to the static list silently
+        this._post({ type: 'presetsError' });
+      })
+      .finally(() => cts.dispose());
   }
 
   // ─── Migration Plan ───────────────────────────────────────────────────────────
@@ -286,6 +356,7 @@ export class MigrationPanel {
     const token = this._cancellationSource.token;
 
     this._lastPlan = '';
+    this._chatHistory = []; // new plan = fresh chat context
     this._post({ type: 'planChunk', chunk: '' }); // clear signal
 
     try {
@@ -346,12 +417,13 @@ export class MigrationPanel {
     const entries = this._getHistory();
     const entry: HistoryEntry = {
       id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-      repoUrl: `https://${analysis.repoInfo.owner}/${analysis.repoInfo.repo}`,
+      repoUrl: `https://${analysis.repoInfo.hostname}/${analysis.repoInfo.owner}/${analysis.repoInfo.repo}`,
       owner: analysis.repoInfo.owner,
       repo: analysis.repoInfo.repo,
       targetStack,
       timestamp: Date.now(),
       plan,
+      analysis,
     };
     entries.unshift(entry);
     await this._globalState.update(HISTORY_KEY, entries.slice(0, MAX_HISTORY));
@@ -360,6 +432,9 @@ export class MigrationPanel {
   private _loadFromHistory(id: string): void {
     const entry = this._getHistory().find((e) => e.id === id);
     if (!entry) { return; }
+    this._lastPlan = entry.plan;
+    this._lastAnalysis = entry.analysis; // restore so debug/exec-summary/progress-check work
+    this._chatHistory = []; // fresh context for this history entry
     // Replay the plan as chunks so the UI renders it
     this._post({ type: 'planChunk', chunk: '' });
     this._post({ type: 'planChunk', chunk: entry.plan });
@@ -374,38 +449,69 @@ export class MigrationPanel {
 
   // ─── Token Validation (enhancement #12) ──────────────────────────────────────
 
-  private async _validateToken(githubToken?: string): Promise<void> {
+  private async _validateToken(githubToken?: string, repoUrl?: string): Promise<void> {
     const token = githubToken || await this._secrets.get(TOKEN_SECRET_KEY);
     if (!token) {
       this._post({ type: 'tokenValidation', isValid: false, message: 'No token provided.' });
       return;
     }
     try {
-      const result = await this._githubUserCheck(token);
+      const result = await this._githubUserCheck(token, repoUrl);
       this._post({ type: 'tokenValidation', isValid: true, username: result });
     } catch (err: any) {
       this._post({ type: 'tokenValidation', isValid: false, message: err.message });
     }
   }
 
-  private _githubUserCheck(token: string): Promise<string> {
-    return new Promise((resolve, reject) => {
-      const https = require('https') as typeof import('https');
-      const req = https.request(
-        { hostname: 'api.github.com', path: '/user', headers: { 'User-Agent': 'vscode-migration-assistant/1.0', Authorization: `Bearer ${token}`, Accept: 'application/vnd.github+json' } },
-        (res: import('http').IncomingMessage) => {
-          let data = '';
-          res.on('data', (c: Buffer) => (data += c));
-          res.on('end', () => {
-            if (res.statusCode === 200) { resolve(JSON.parse(data).login); }
-            else { reject(new Error(`Token invalid (HTTP ${res.statusCode})`)); }
-          });
+  private async _githubUserCheck(token: string, repoUrl?: string): Promise<string> {
+    const headers = {
+      'User-Agent': 'vscode-migration-assistant/1.0',
+      'Authorization': `Bearer ${token}`,
+      'Accept': 'application/vnd.github+json',
+    };
+    const fetchJson = async (url: string) => {
+      const res = await fetch(url, { headers });
+      return { status: res.status, body: await res.json() as Record<string, unknown> };
+    };
+
+    // 1️⃣ Try /user — works when the classic PAT has any read scope
+    try {
+      const { status, body } = await fetchJson('https://api.github.com/user');
+      if (status === 200) { return (body.login as string) ?? 'authenticated'; }
+    } catch { /* fall through */ }
+
+    // 2️⃣ Try /rate_limit — works with any valid token regardless of scopes
+    try {
+      const { status, body } = await fetchJson('https://api.github.com/rate_limit');
+      if (status === 200) {
+        const core = (body as any)?.resources?.core as { limit?: number; remaining?: number } | undefined;
+        const limit = core?.limit ?? 0;
+        const remaining = core?.remaining ?? 0;
+        if (limit >= 5000) {
+          return `authenticated (${remaining}/${limit} requests remaining)`;
         }
-      );
-      req.on('error', reject);
-      req.setTimeout(8000, () => req.destroy(new Error('Timeout')));
-      req.end();
-    });
+      }
+    } catch { /* fall through */ }
+
+    // 3️⃣ Last resort — try the actual repo the user entered.
+    //    This is exactly the endpoint the analysis uses, so if it works the token is fine.
+    if (repoUrl) {
+      try {
+        const { parseGitHubUrl } = await import('./githubAnalyzer');
+        const { owner, repo, hostname } = parseGitHubUrl(repoUrl);
+        const apiBase = hostname === 'github.com' ? 'https://api.github.com' : `https://${hostname}/api/v3`;
+        const { status } = await fetchJson(`${apiBase}/repos/${owner}/${repo}`);
+        if (status === 200) {
+          return `token works for ${owner}/${repo}`;
+        }
+      } catch { /* fall through */ }
+    }
+
+    throw new Error(
+      'Could not verify token against GitHub API. ' +
+      'If repository analysis works, your token is valid — ' +
+      'your organisation may restrict the /user endpoint (SAML SSO or scope policy).'
+    );
   }
 
   // ─── Save Plan as .md (enhancement #2) ───────────────────────────────────────
@@ -525,6 +631,64 @@ export class MigrationPanel {
     }
   }
 
+  // ─── Stack Recommendations ────────────────────────────────────────────────────
+
+  private async _runStackRecommendations(): Promise<void> {
+    if (!this._lastAnalysis) {
+      this._post({ type: 'error', message: 'Analyze a repository first.' });
+      return;
+    }
+    this._cancellationSource?.cancel();
+    this._cancellationSource = new vscode.CancellationTokenSource();
+    this._post({ type: 'stackRecsChunk', chunk: '' });
+    try {
+      await streamStackRecommendations(
+        this._lastAnalysis,
+        (chunk) => this._post({ type: 'stackRecsChunk', chunk }),
+        this._cancellationSource.token
+      );
+      this._post({ type: 'stackRecsComplete' });
+    } catch (err: any) {
+      this._post({ type: 'error', message: err.message });
+    }
+  }
+
+  // ─── AI Stack Detection ───────────────────────────────────────────────────────
+
+  private async _runAIStackDetection(): Promise<void> {
+    if (!this._lastAnalysis) { return; }
+    this._cancellationSource?.cancel();
+    this._cancellationSource = new vscode.CancellationTokenSource();
+    try {
+      const aiStack = await detectStackWithAI(this._lastAnalysis, this._cancellationSource.token);
+      this._post({ type: 'aiStackDetected', aiStack });
+    } catch {
+      // Silent — fallback to rule-based stack already shown
+    }
+  }
+
+  // ─── Stack Health Analysis ────────────────────────────────────────────────────
+
+  private async _runStackHealthAnalysis(): Promise<void> {
+    if (!this._lastAnalysis) {
+      this._post({ type: 'error', message: 'Analyze a repository first.' });
+      return;
+    }
+    this._cancellationSource?.cancel();
+    this._cancellationSource = new vscode.CancellationTokenSource();
+    this._post({ type: 'stackHealthChunk', chunk: '' });
+    try {
+      await streamStackHealthAnalysis(
+        this._lastAnalysis,
+        (chunk) => this._post({ type: 'stackHealthChunk', chunk }),
+        this._cancellationSource.token
+      );
+      this._post({ type: 'stackHealthComplete' });
+    } catch (err: any) {
+      this._post({ type: 'error', message: err.message });
+    }
+  }
+
   // ─── Export Plan (enhancement #4) ────────────────────────────────────────────
 
   private async _exportPlan(format: import('./types').ExportFormat): Promise<void> {
@@ -542,12 +706,14 @@ export class MigrationPanel {
     this._cancellationSource?.cancel();
     this._cancellationSource = new vscode.CancellationTokenSource();
     this._post({ type: 'exportReady', exportFormat: format, exportContent: '' });
+    const config2 = vscode.workspace.getConfiguration('migrationAssistant');
+    const exportTargetStack = config2.get<string>('lastTargetStack', 'target stack');
     try {
       let content = '';
       await streamExportFormat(
         this._lastPlan, format,
         this._lastAnalysis.repoInfo.repo,
-        'target stack',
+        exportTargetStack,
         (chunk) => { content += chunk; this._post({ type: 'exportReady', exportFormat: format, exportContent: content }); },
         this._cancellationSource.token
       );
@@ -579,9 +745,7 @@ export class MigrationPanel {
       this._post({ type: 'error', message: 'Analyze a repository and generate a plan first.' });
       return;
     }
-    const { owner, repo, hostname } = parseGitHubUrl(
-      `https://${this._lastAnalysis.repoInfo.owner}/${this._lastAnalysis.repoInfo.repo}`
-    );
+    const { owner, repo, hostname } = this._lastAnalysis.repoInfo;
     const storedToken = await this._secrets.get(TOKEN_SECRET_KEY);
     const base = this._lastAnalysis.repoInfo.defaultBranch;
     const compare = compareBranch || 'HEAD';
@@ -600,6 +764,110 @@ export class MigrationPanel {
       this._post({ type: 'progressComplete' });
     } catch (err: any) {
       this._post({ type: 'error', message: err.message });
+    }
+  }
+
+  // ─── Interactive Chat ─────────────────────────────────────────────────────────
+
+  private async _runChat(question: string): Promise<void> {
+    if (!this._lastPlan || !this._lastAnalysis) {
+      this._post({ type: 'error', message: 'Generate a migration plan first before using the chat.' });
+      return;
+    }
+    if (!question.trim()) { return; }
+
+    // Push the user's message into history immediately
+    this._chatHistory.push({ role: 'user', content: question, timestamp: Date.now() });
+
+    this._cancellationSource?.cancel();
+    this._cancellationSource = new vscode.CancellationTokenSource();
+
+    const config = vscode.workspace.getConfiguration('migrationAssistant');
+    const targetStack = config.get<string>('lastTargetStack', 'target stack');
+
+    let replyBuffer = '';
+    this._post({ type: 'chatChunk', chunk: '' }); // signal: new assistant turn starting
+
+    try {
+      await streamChatReply(
+        this._lastAnalysis,
+        this._lastPlan,
+        targetStack,
+        this._chatHistory,
+        question,
+        (chunk) => {
+          replyBuffer += chunk;
+          this._post({ type: 'chatChunk', chunk });
+        },
+        this._cancellationSource.token
+      );
+      // Persist the completed assistant reply in history
+      this._chatHistory.push({ role: 'assistant', content: replyBuffer, timestamp: Date.now() });
+      this._post({ type: 'chatComplete' });
+    } catch (err: any) {
+      if (this._cancellationSource.token.isCancellationRequested) {
+        this._post({ type: 'chatComplete' });
+      } else {
+        // Remove the unanswered user message so history stays consistent
+        this._chatHistory.pop();
+        this._post({ type: 'error', message: err.message || String(err) });
+        return;
+      }
+    }
+
+    // ── Stack-change intent detection (runs silently after chat reply) ──────
+    // Only check when there is a plan and the user's message is non-trivial
+    if (this._lastPlan && question.length > 10 && !this._cancellationSource.token.isCancellationRequested) {
+      try {
+        const intentToken = new vscode.CancellationTokenSource();
+        const intent = await detectStackChangeIntent(
+          question,
+          this._lastPlan,
+          intentToken.token
+        );
+        intentToken.dispose();
+
+        if (intent && intent.fromComponent && intent.toComponent) {
+          this._pendingStackChange = intent;
+          // Notify the UI so it can show a "Apply to plan" confirmation banner
+          this._post({ type: 'stackChangeDetected', stackChangeIntent: intent });
+        }
+      } catch {
+        // Intent detection is best-effort — never surface errors to the user
+      }
+    }
+  }
+
+  // ─── Apply Plan Patch ─────────────────────────────────────────────────────────
+
+  public async applyPendingPlanPatch(): Promise<void> {
+    const intent = this._pendingStackChange;
+    if (!intent || !this._lastAnalysis || !this._lastPlan) {
+      this._post({ type: 'error', message: 'No pending stack change to apply.' });
+      return;
+    }
+    this._pendingStackChange = undefined;
+
+    this._cancellationSource?.cancel();
+    this._cancellationSource = new vscode.CancellationTokenSource();
+
+    // Signal the UI that the plan is being rewritten
+    this._post({ type: 'planPatchChunk', chunk: '' });
+
+    try {
+      await streamPlanPatch(
+        this._lastAnalysis,
+        this._lastPlan,
+        intent,
+        (chunk) => this._post({ type: 'planPatchChunk', chunk }),
+        (patchedPlan) => {
+          this._lastPlan = patchedPlan;
+          this._post({ type: 'planPatchComplete', patchedPlan });
+        },
+        this._cancellationSource.token
+      );
+    } catch (err: any) {
+      this._post({ type: 'error', message: err.message || String(err) });
     }
   }
 
@@ -637,11 +905,20 @@ export class MigrationPanel {
     const token = this._cancellationSource.token;
 
     let fullReport = '';
+    let reportChunkCount = 0;
     try {
       await streamDetailedReport(
         this._lastAnalysis,
         resolvedTarget,
-        (chunk) => { fullReport += chunk; },
+        (chunk) => {
+          fullReport += chunk;
+          // Animate progress bar as content streams in (step 1 of 3 = 0–33%)
+          reportChunkCount++;
+          if (reportChunkCount % 5 === 0) {
+            const pct = Math.min(30, reportChunkCount * 0.3);
+            this._post({ type: 'progress', message: `Receiving report content… (${fullReport.length} chars)`, step: pct, totalSteps: 100 });
+          }
+        },
         token
       );
     } catch (err: any) {
@@ -649,7 +926,14 @@ export class MigrationPanel {
       return;
     }
 
-    this._post({ type: 'progress', message: 'Building document…', step: 2, totalSteps: 3 });
+    // Guard: reject suspiciously short or refusal-only content before writing
+    const stripped = fullReport.replace(/\s+/g, ' ').trim();
+    if (stripped.length < 300 || /sorry[\s,]+i[\s\u2019\u0027]+can[\s\u2019\u0027]+t\s+assist|cannot assist with that|i'?m not able to help|i'?m unable to (assist|generate|provide)/i.test(stripped)) {
+      this._post({ type: 'reportError', message: 'Copilot declined to generate the report content. Try a different model or simplify the analysis.' });
+      return;
+    }
+
+    this._post({ type: 'progress', message: 'Building document…', step: 60, totalSteps: 100 });
 
     try {
       let fileBuffer: Uint8Array;
@@ -676,7 +960,7 @@ export class MigrationPanel {
 
       if (saveUri) {
         await vscode.workspace.fs.writeFile(saveUri, fileBuffer);
-        this._post({ type: 'progress', message: `Report saved: ${saveUri.fsPath}`, step: 3, totalSteps: 3 });
+        this._post({ type: 'progress', message: `Report saved: ${saveUri.fsPath}`, step: 100, totalSteps: 100 });
         this._post({ type: 'reportReady', message: saveUri.fsPath });
         vscode.window.showInformationMessage(
           `Migration report saved: ${path.basename(saveUri.fsPath)}`,
@@ -690,6 +974,66 @@ export class MigrationPanel {
     } catch (err: any) {
       this._post({ type: 'reportError', message: err.message || String(err) });
     }
+  }
+
+  // ─── Jira Stories Generation ────────────────────────────────────────────────
+
+  private async _generateJiraStories(targetStack: string, config: JiraStoriesConfig): Promise<void> {
+    if (!this._lastAnalysis || !this._lastPlan) {
+      this._post({ type: 'error', message: 'Generate a migration plan first.' });
+      return;
+    }
+
+    const resolvedTarget = targetStack ||
+      (vscode.workspace.getConfiguration('migrationAssistant').get<string>('lastTargetStack') ?? 'modern stack');
+
+    this._cancellationSource?.cancel();
+    this._cancellationSource = new vscode.CancellationTokenSource();
+    const token = this._cancellationSource.token;
+
+    try {
+      const stories = await streamJiraStories(
+        this._lastAnalysis,
+        resolvedTarget,
+        this._lastPlan,
+        config,
+        (chunk) => { this._post({ type: 'jiraStoriesChunk', chunk }); },
+        token
+      );
+
+      // Build CSV for Jira import
+      const csvRows = [
+        ['Summary', 'Issue Type', 'Priority', 'Story Points', 'Sprint', 'Labels', 'Component', 'Description', 'Acceptance Criteria', 'Estimated Days', 'Epic Name', 'Suggestions'].join(','),
+      ];
+      for (const s of stories) {
+        csvRows.push([
+          this._csvEscape(s.summary),
+          'Story',
+          s.priority,
+          String(s.storyPoints),
+          this._csvEscape(s.sprint),
+          this._csvEscape(s.labels.join(';')),
+          this._csvEscape(s.component),
+          this._csvEscape(s.description),
+          this._csvEscape(s.acceptanceCriteria),
+          String(s.estimatedDays),
+          this._csvEscape(s.epicName),
+          this._csvEscape(s.suggestions),
+        ].join(','));
+      }
+
+      const csvContent = csvRows.join('\n');
+      this._post({ type: 'jiraStoriesCsv', csvContent });
+      this._post({ type: 'jiraStoriesComplete' });
+    } catch (err: any) {
+      this._post({ type: 'error', message: `Jira stories error: ${err.message || String(err)}` });
+      this._post({ type: 'jiraStoriesComplete' });
+    }
+  }
+
+  private _csvEscape(value: string): string {
+    const v = value.replace(/\r?\n/g, ' ').replace(/"/g, '""');
+    return `"${v}"`;
   }
 
   // ─── Webview HTML ─────────────────────────────────────────────────────────────
@@ -888,6 +1232,82 @@ export class MigrationPanel {
     margin-left: 4px;
   }
 
+  /* ── Stack Health ── */
+  .health-summary {
+    font-size: 12px;
+    font-weight: 600;
+    padding: 8px 10px;
+    border-radius: var(--radius);
+    margin-bottom: 8px;
+    background: var(--vscode-editor-inactiveSelectionBackground);
+    border: 1px solid var(--vscode-panel-border);
+  }
+  .health-cards { display: flex; flex-direction: column; gap: 6px; }
+  .health-card {
+    border-radius: var(--radius);
+    padding: 9px 11px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    border-left: 3px solid transparent;
+  }
+  .health-card.impact-high   { border-left-color: #f44336; background: rgba(244,67,54,0.07); }
+  .health-card.impact-medium { border-left-color: #ff9800; background: rgba(255,152,0,0.07); }
+  .health-card.impact-low    { border-left-color: #4caf50; background: rgba(76,175,80,0.07); }
+  .health-card-title { font-weight: 600; font-size: 12px; }
+  .health-impact {
+    font-size: 10px;
+    font-weight: 700;
+    padding: 1px 6px;
+    border-radius: 8px;
+    display: inline-block;
+    margin-left: 6px;
+  }
+  .health-card.impact-high   .health-impact { background:#f44336; color:#fff; }
+  .health-card.impact-medium .health-impact { background:#ff9800; color:#fff; }
+  .health-card.impact-low    .health-impact { background:#4caf50; color:#fff; }
+  .health-problem { font-size: 11px; color: var(--vscode-foreground); opacity: 0.9; }
+  .health-fix {
+    font-size: 11px;
+    color: var(--vscode-foreground);
+    background: var(--vscode-editor-inactiveSelectionBackground);
+    border-radius: 4px;
+    padding: 4px 7px;
+    border-left: 2px solid var(--vscode-focusBorder);
+  }
+  .health-fix::before { content: '→ '; font-weight: 600; }
+
+  /* ── Stack Recommendation Cards ── */
+  .rec-cards { display: flex; flex-direction: column; gap: 8px; margin-top: 8px; }
+  .rec-card {
+    background: var(--vscode-editor-inactiveSelectionBackground);
+    border: 1px solid var(--vscode-panel-border);
+    border-radius: var(--radius);
+    padding: 10px 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .rec-card-header { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .rec-title { font-weight: 600; font-size: 12px; flex: 1; }
+  .effort-badge {
+    font-size: 10px;
+    font-weight: 600;
+    padding: 2px 7px;
+    border-radius: 10px;
+    white-space: nowrap;
+  }
+  .effort-low    { background: #2d6a2d; color: #c8e6c9; }
+  .effort-medium { background: #7a5500; color: #fff3cd; }
+  .effort-high   { background: #7a2020; color: #ffcdd2; }
+  .effort-very-high { background: #5a0a5a; color: #f3e5f5; }
+  .rec-bestfor { font-size: 11px; color: var(--vscode-descriptionForeground); margin: 0; }
+  .rec-body { font-size: 11px; line-height: 1.5; }
+  .rec-body ul { margin: 2px 0; padding-left: 16px; }
+  .rec-body li { margin: 1px 0; }
+  .rec-use-btn { margin-top: 4px; align-self: flex-start; }
+  .recs-loading { font-size: 11px; color: var(--vscode-descriptionForeground); padding: 6px 0; }
+
   /* ── Progress ── */
   .progress-bar-wrap {
     background: var(--vscode-progressBar-background, var(--vscode-panel-border));
@@ -1018,6 +1438,148 @@ export class MigrationPanel {
   #plan-rendered em { font-style: italic; }
   #plan-rendered hr { border: none; border-top: 1px solid var(--vscode-panel-border); margin: 16px 0; }
 
+  /* ── Chat ── */
+  #tab-chat {
+    display: none;
+    flex-direction: column;
+    height: 100%;
+    padding: 0;
+    overflow: hidden;
+  }
+  #tab-chat.active { display: flex; }
+
+  .chat-thread {
+    flex: 1;
+    overflow-y: auto;
+    padding: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+
+  .chat-bubble {
+    max-width: 85%;
+    padding: 9px 13px;
+    border-radius: 12px;
+    font-size: 12px;
+    line-height: 1.6;
+    word-break: break-word;
+  }
+  .chat-bubble.user {
+    align-self: flex-end;
+    background: var(--vscode-button-background);
+    color: var(--vscode-button-foreground);
+    border-bottom-right-radius: 3px;
+  }
+  .chat-bubble.assistant {
+    align-self: flex-start;
+    background: var(--vscode-editor-inactiveSelectionBackground);
+    border: 1px solid var(--vscode-panel-border);
+    border-bottom-left-radius: 3px;
+  }
+  .chat-bubble.assistant h1,
+  .chat-bubble.assistant h2,
+  .chat-bubble.assistant h3 { margin: 10px 0 5px; font-weight: 600; }
+  .chat-bubble.assistant h1 { font-size: 14px; }
+  .chat-bubble.assistant h2 { font-size: 13px; }
+  .chat-bubble.assistant h3 { font-size: 12px; }
+  .chat-bubble.assistant p  { margin: 4px 0; }
+  .chat-bubble.assistant ul,
+  .chat-bubble.assistant ol { padding-left: 18px; margin: 4px 0; }
+  .chat-bubble.assistant li { margin: 2px 0; }
+  .chat-bubble.assistant code {
+    background: var(--vscode-textCodeBlock-background);
+    padding: 1px 4px;
+    border-radius: 3px;
+    font-family: var(--vscode-editor-font-family, monospace);
+    font-size: 11px;
+  }
+  .chat-bubble.assistant pre {
+    background: var(--vscode-textCodeBlock-background);
+    border: 1px solid var(--vscode-panel-border);
+    border-radius: 4px;
+    padding: 8px;
+    overflow-x: auto;
+    margin: 6px 0;
+    font-size: 11px;
+  }
+  .chat-bubble.assistant pre code { background: none; padding: 0; }
+  .chat-bubble.assistant table {
+    border-collapse: collapse; width: 100%; font-size: 11px; margin: 6px 0;
+  }
+  .chat-bubble.assistant th,
+  .chat-bubble.assistant td {
+    border: 1px solid var(--vscode-panel-border); padding: 4px 8px;
+  }
+  .chat-bubble.assistant th { background: var(--vscode-editor-inactiveSelectionBackground); font-weight: 600; }
+  .chat-bubble.assistant strong { font-weight: 600; }
+  .chat-bubble.assistant em { font-style: italic; }
+  .chat-bubble.assistant blockquote {
+    border-left: 2px solid var(--vscode-focusBorder);
+    margin: 4px 0; padding: 2px 10px;
+    color: var(--vscode-descriptionForeground);
+  }
+
+  .chat-role-label {
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    opacity: 0.55;
+    margin-bottom: 3px;
+  }
+  .chat-msg-wrap { display: flex; flex-direction: column; }
+  .chat-msg-wrap.user { align-items: flex-end; }
+  .chat-msg-wrap.assistant { align-items: flex-start; }
+
+  .chat-input-area {
+    flex-shrink: 0;
+    border-top: 1px solid var(--vscode-panel-border);
+    padding: 10px 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    background: var(--vscode-editor-background);
+  }
+  .chat-input-row {
+    display: flex;
+    gap: 8px;
+    align-items: flex-end;
+  }
+  #chat-input {
+    flex: 1;
+    resize: none;
+    min-height: 38px;
+    max-height: 120px;
+    overflow-y: auto;
+    font-size: 12px;
+    line-height: 1.5;
+  }
+  .chat-send-btn {
+    flex-shrink: 0;
+    width: auto;
+    padding: 7px 14px;
+    font-size: 12px;
+  }
+  .chat-actions-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+  .chat-hint {
+    font-size: 10px;
+    color: var(--vscode-descriptionForeground);
+    opacity: 0.7;
+  }
+  .chat-typing {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 11px;
+    color: var(--vscode-descriptionForeground);
+    padding: 4px 0;
+  }
+
   /* ── Cursor blink ── */
   .cursor {
     display: inline-block;
@@ -1050,6 +1612,52 @@ export class MigrationPanel {
     font-size: 12px;
     line-height: 1.5;
     white-space: pre-wrap;
+  }
+
+  /* ── Stack-change confirmation banner ── */
+  .stack-change-banner {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    background: var(--vscode-inputValidation-infoBackground, #1e3a4a);
+    border: 1px solid var(--vscode-inputValidation-infoBorder, #2196f3);
+    border-left: 4px solid var(--vscode-inputValidation-infoBorder, #2196f3);
+    border-radius: var(--radius);
+    padding: 10px 12px;
+    margin: 8px 0;
+    font-size: 12px;
+    line-height: 1.5;
+    animation: fadeIn 0.2s ease;
+  }
+  .stack-change-banner .banner-icon { font-size: 16px; flex-shrink: 0; padding-top: 1px; }
+  .stack-change-banner .banner-body { flex: 1; }
+  .stack-change-banner .banner-title { font-weight: 600; margin-bottom: 4px; }
+  .stack-change-banner .banner-reason { color: var(--vscode-descriptionForeground); margin-bottom: 8px; font-style: italic; }
+  .stack-change-banner .banner-actions { display: flex; gap: 8px; }
+  .stack-change-banner .banner-apply {
+    background: var(--vscode-button-background);
+    color: var(--vscode-button-foreground);
+    border: none; border-radius: 3px;
+    padding: 4px 12px; cursor: pointer; font-size: 12px;
+  }
+  .stack-change-banner .banner-apply:hover { background: var(--vscode-button-hoverBackground); }
+  .stack-change-banner .banner-dismiss {
+    background: transparent;
+    color: var(--vscode-descriptionForeground);
+    border: 1px solid var(--vscode-widget-border, #555);
+    border-radius: 3px; padding: 4px 10px; cursor: pointer; font-size: 12px;
+  }
+  .stack-change-banner .banner-dismiss:hover { color: var(--vscode-foreground); }
+
+  /* ── Plan patch progress ── */
+  .plan-patch-indicator {
+    display: flex; align-items: center; gap: 8px;
+    padding: 6px 10px;
+    background: var(--vscode-inputValidation-infoBackground, #1e3a4a);
+    border-radius: var(--radius);
+    font-size: 11px;
+    color: var(--vscode-descriptionForeground);
+    margin-bottom: 4px;
   }
 
   /* ── File tree ── */
@@ -1177,7 +1785,14 @@ export class MigrationPanel {
       </div>
 
       <div class="field" style="margin-top:8px">
-        <label>Quick Presets</label>
+        <label style="display:flex;align-items:center;gap:6px">
+          Quick Presets
+          <span id="preset-loading" style="display:none;font-size:10px;color:var(--vscode-descriptionForeground)">
+            <span class="dot-pulse" style="display:inline-flex;gap:2px"><span></span><span></span><span></span></span>
+            AI generating…
+          </span>
+          <span id="preset-ai-badge" style="display:none;font-size:10px;background:var(--vscode-badge-background);color:var(--vscode-badge-foreground);border-radius:8px;padding:1px 6px">✨ AI</span>
+        </label>
         <select id="preset-select">
           <option value="">— choose a preset —</option>
           <optgroup label="JavaScript / TypeScript">
@@ -1253,13 +1868,39 @@ export class MigrationPanel {
       <button class="btn btn-danger" id="btn-stop" style="margin-top:6px; display:none">
         ⏹ Stop Generation
       </button>
+      <button class="btn btn-secondary" id="btn-suggest" style="margin-top:6px" disabled>
+        💡 Suggest Migration Targets
+      </button>
+    </div>
+
+    <!-- AI Target Recommendations -->
+    <div id="recs-section" style="display:none">
+      <hr style="border:none;border-top:1px solid var(--vscode-panel-border); margin-bottom:10px">
+      <div class="section-title">AI-Recommended Migration Targets</div>
+      <div id="recs-loading" class="recs-loading" style="display:none">Analyzing your stack…</div>
+      <div id="recs-cards" class="rec-cards"></div>
     </div>
 
     <!-- Detected Stack (shown after analysis) -->
     <div id="stack-section" style="display:none">
       <hr style="border:none;border-top:1px solid var(--vscode-panel-border); margin-bottom:10px">
-      <div class="section-title">Detected Stack</div>
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">
+        <div class="section-title" style="margin-bottom:0">Detected Stack</div>
+        <button class="btn btn-secondary" id="btn-health" style="font-size:11px;padding:3px 8px">
+          🔬 Analyze Health
+        </button>
+      </div>
+      <div id="stack-ai-loading" style="display:none;font-size:11px;color:var(--vscode-descriptionForeground);padding:4px 0;display:none">
+        ✨ AI is analyzing your stack…
+      </div>
       <div class="stack-card" id="stack-card"></div>
+
+      <!-- Health Results -->
+      <div id="health-section" style="display:none;margin-top:10px">
+        <div id="health-loading" class="recs-loading" style="display:none">Auditing your stack…</div>
+        <div id="health-summary" class="health-summary" style="display:none"></div>
+        <div id="health-cards" class="health-cards"></div>
+      </div>
     </div>
 
     <!-- Queue Section (enhancement #6) -->
@@ -1294,6 +1935,7 @@ export class MigrationPanel {
   <div class="content">
     <div class="content-tabs">
       <button class="tab active" data-tab="plan">Plan</button>
+      <button class="tab" data-tab="chat">💬 Chat</button>
       <button class="tab" data-tab="previews">File Previews</button>
       <button class="tab" data-tab="debug">Debug</button>
       <button class="tab" data-tab="org">Org Dashboard</button>
@@ -1334,10 +1976,51 @@ export class MigrationPanel {
               <option value="word">📄 Word (.docx)</option>
               <option value="html">🌐 HTML / PDF</option>
             </select>
+            <button class="copy-btn" id="btn-jira-stories" title="Generate Jira stories for this migration" disabled>🎫 Jira Stories</button>
             <button class="copy-btn" id="btn-copy">Copy</button>
           </div>
         </div>
         <div id="plan-rendered" style="flex:1; overflow:auto"></div>
+      </div>
+    </div>
+
+    <!-- Chat Tab -->
+    <div class="tab-content" id="tab-chat">
+      <div id="chat-empty-state" class="empty-state" style="display:none">
+        <div class="empty-icon">💬</div>
+        <div class="empty-title">No plan yet</div>
+        <div class="empty-sub">Generate a migration plan first, then come back here to ask follow-up questions.</div>
+      </div>
+      <!-- Stack-change confirmation banner (hidden until the extension detects an intent) -->
+      <div id="stack-change-banner" class="stack-change-banner" style="display:none">
+        <div class="banner-icon">🔄</div>
+        <div class="banner-body">
+          <div class="banner-title" id="stack-change-title"></div>
+          <div class="banner-reason" id="stack-change-reason" style="display:none"></div>
+          <div class="banner-actions">
+            <button class="banner-apply" id="btn-apply-stack-change">Apply to plan</button>
+            <button class="banner-dismiss" id="btn-dismiss-stack-change">Dismiss</button>
+          </div>
+        </div>
+      </div>
+      <!-- Plan-patch progress indicator (shown while sections are being rewritten) -->
+      <div id="plan-patch-indicator" class="plan-patch-indicator" style="display:none">
+        <div class="dot-pulse"><span></span><span></span><span></span></div>
+        Rewriting plan — <span id="plan-patch-status">updating affected sections…</span>
+      </div>
+      <div class="chat-thread" id="chat-thread"></div>
+      <div class="chat-input-area">
+        <div class="chat-input-row">
+          <textarea id="chat-input" rows="2"
+            placeholder="Ask anything about the migration plan… e.g. Why do we need to replace express? What's the risk of step 3?"
+            disabled></textarea>
+          <button class="btn btn-primary chat-send-btn" id="btn-chat-send" disabled>Send</button>
+          <button class="btn btn-danger chat-send-btn" id="btn-chat-stop" style="display:none">⏹</button>
+        </div>
+        <div class="chat-actions-row">
+          <span class="chat-hint" id="chat-hint">Generate a migration plan first to enable the chat.</span>
+          <button class="copy-btn" id="btn-chat-clear" style="font-size:10px" disabled>Clear chat</button>
+        </div>
       </div>
     </div>
 
@@ -1472,6 +2155,45 @@ export class MigrationPanel {
       <pre id="export-content" style="flex:1;overflow:auto;white-space:pre-wrap;font-size:12px;background:var(--vscode-editor-background);border:1px solid var(--vscode-panel-border);border-radius:6px;padding:12px"></pre>
     </div>
 
+    <!-- Jira Stories Config Modal -->
+    <div id="jira-config-modal" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.5);z-index:200;display:none;align-items:center;justify-content:center">
+      <div style="background:var(--vscode-editor-background);border:1px solid var(--vscode-panel-border);border-radius:10px;padding:24px;width:380px;max-width:90vw">
+        <h3 style="margin:0 0 16px 0">🎫 Generate Jira Stories</h3>
+        <div style="margin-bottom:12px">
+          <label style="display:block;margin-bottom:4px;font-weight:600;font-size:12px">Team Size</label>
+          <input type="number" id="jira-team-size" min="1" max="50" value="4" style="width:100%;padding:6px 10px;border-radius:4px;border:1px solid var(--vscode-input-border);background:var(--vscode-input-background);color:var(--vscode-input-foreground)">
+        </div>
+        <div style="margin-bottom:16px">
+          <label style="display:block;margin-bottom:6px;font-weight:600;font-size:12px">Team Roles</label>
+          <div style="display:flex;flex-wrap:wrap;gap:6px">
+            <label style="font-size:11px;display:flex;align-items:center;gap:4px"><input type="checkbox" class="jira-role-cb" value="Senior Developer" checked> Senior Dev</label>
+            <label style="font-size:11px;display:flex;align-items:center;gap:4px"><input type="checkbox" class="jira-role-cb" value="Junior Developer" checked> Junior Dev</label>
+            <label style="font-size:11px;display:flex;align-items:center;gap:4px"><input type="checkbox" class="jira-role-cb" value="QA Engineer"> QA</label>
+            <label style="font-size:11px;display:flex;align-items:center;gap:4px"><input type="checkbox" class="jira-role-cb" value="DevOps Engineer"> DevOps</label>
+            <label style="font-size:11px;display:flex;align-items:center;gap:4px"><input type="checkbox" class="jira-role-cb" value="Tech Lead"> Tech Lead</label>
+            <label style="font-size:11px;display:flex;align-items:center;gap:4px"><input type="checkbox" class="jira-role-cb" value="Architect"> Architect</label>
+          </div>
+        </div>
+        <div style="display:flex;gap:8px;justify-content:flex-end">
+          <button class="copy-btn" id="jira-config-cancel">Cancel</button>
+          <button class="btn btn-primary" id="jira-config-go" style="padding:6px 16px">Generate Stories</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Jira Stories Output Overlay -->
+    <div id="jira-output-wrap" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:var(--vscode-editor-background);z-index:100;padding:20px;display:none;flex-direction:column;gap:10px">
+      <div style="display:flex;justify-content:space-between;align-items:center">
+        <strong>🎫 Jira Stories</strong>
+        <div style="display:flex;gap:8px">
+          <button class="copy-btn" id="btn-copy-jira">Copy Markdown</button>
+          <button class="copy-btn" id="btn-csv-jira">⬇ Download CSV</button>
+          <button class="copy-btn" id="btn-close-jira">✕ Close</button>
+        </div>
+      </div>
+      <div id="jira-output" style="flex:1;overflow:auto;white-space:pre-wrap;font-size:12px;background:var(--vscode-editor-background);border:1px solid var(--vscode-panel-border);border-radius:6px;padding:12px"></div>
+    </div>
+
     <!-- Security Report Tab (enhancement #11) -->
     <div class="tab-content" id="tab-security">
       <div class="empty-state" id="security-empty">
@@ -1511,6 +2233,15 @@ let lastRepoUrl   = '';
 const btnAnalyze       = document.getElementById('btn-analyze');
 const btnGenerate      = document.getElementById('btn-generate');
 const btnStop          = document.getElementById('btn-stop');
+const btnSuggest       = document.getElementById('btn-suggest');
+const recsSection      = document.getElementById('recs-section');
+const recsLoading      = document.getElementById('recs-loading');
+const recsCards        = document.getElementById('recs-cards');
+const btnHealth        = document.getElementById('btn-health');
+const healthSection    = document.getElementById('health-section');
+const healthLoading    = document.getElementById('health-loading');
+const healthSummary    = document.getElementById('health-summary');
+const healthCards      = document.getElementById('health-cards');
 const btnSettings      = document.getElementById('btn-settings');
 const btnCopy          = document.getElementById('btn-copy');
 const btnSaveMd        = document.getElementById('btn-save-md');
@@ -1523,6 +2254,8 @@ const inputToken       = document.getElementById('input-token');
 const inputTarget      = document.getElementById('input-target');
 const queueInput       = document.getElementById('queue-input');
 const presetSelect     = document.getElementById('preset-select');
+const presetLoading    = document.getElementById('preset-loading');
+const presetAiBadge    = document.getElementById('preset-ai-badge');
 const detailLevel      = document.getElementById('detail-level');
 const optTests         = document.getElementById('opt-tests');
 const optCi            = document.getElementById('opt-ci');
@@ -1535,6 +2268,7 @@ const cacheNotice      = document.getElementById('cache-notice');
 const tokenStatus      = document.getElementById('token-status');
 const stackSection     = document.getElementById('stack-section');
 const stackCard        = document.getElementById('stack-card');
+const stackAiLoading   = document.getElementById('stack-ai-loading');
 const planEmpty        = document.getElementById('plan-empty');
 const planContainer    = document.getElementById('plan-container');
 const planRendered     = document.getElementById('plan-rendered');
@@ -1584,8 +2318,55 @@ const progressRendered = document.getElementById('progress-rendered');
 const progressIndicator= document.getElementById('progress-indicator');
 const scopeSelect      = document.getElementById('scope-select');
 const optPhased        = document.getElementById('opt-phased');
+const btnJiraStories   = document.getElementById('btn-jira-stories');
+const jiraConfigModal  = document.getElementById('jira-config-modal');
+const jiraTeamSizeInput= document.getElementById('jira-team-size');
+const jiraConfigCancel = document.getElementById('jira-config-cancel');
+const jiraConfigGo     = document.getElementById('jira-config-go');
+const jiraOutputWrap   = document.getElementById('jira-output-wrap');
+const jiraOutput       = document.getElementById('jira-output');
+const btnCopyJira      = document.getElementById('btn-copy-jira');
+const btnCsvJira       = document.getElementById('btn-csv-jira');
+const btnCloseJira     = document.getElementById('btn-close-jira');
+let jiraMarkdown       = '';
+let jiraCsvContent     = '';
 let previewsMarkdown   = '';
 let exportMarkdown     = '';
+let stackRecsMarkdown  = '';
+let stackHealthMarkdown = '';
+
+// ─── Chat State ────────────────────────────────────────────────────────────────
+let chatReady     = false; // true once a plan has been generated
+let chatReplying  = false; // true while streaming an assistant reply
+let chatReplyBuf  = '';    // accumulates current assistant turn
+
+const chatThread    = document.getElementById('chat-thread');
+const chatInput     = document.getElementById('chat-input');
+const btnChatSend   = document.getElementById('btn-chat-send');
+const btnChatStop   = document.getElementById('btn-chat-stop');
+const btnChatClear  = document.getElementById('btn-chat-clear');
+const chatHint      = document.getElementById('chat-hint');
+const chatEmptyState = document.getElementById('chat-empty-state');
+
+// ─── Stack-change banner state ─────────────────────────────────────────────────
+const stackChangeBanner    = document.getElementById('stack-change-banner');
+const stackChangeTitle     = document.getElementById('stack-change-title');
+const stackChangeReason    = document.getElementById('stack-change-reason');
+const planPatchIndicator   = document.getElementById('plan-patch-indicator');
+const planPatchStatus      = document.getElementById('plan-patch-status');
+const btnApplyStackChange  = document.getElementById('btn-apply-stack-change');
+const btnDismissStackChange = document.getElementById('btn-dismiss-stack-change');
+
+btnApplyStackChange.addEventListener('click', () => {
+  stackChangeBanner.style.display = 'none';
+  planPatchIndicator.style.display = 'flex';
+  planPatchStatus.textContent = 'updating affected sections…';
+  vscode.postMessage({ type: 'applyStackChange' });
+});
+
+btnDismissStackChange.addEventListener('click', () => {
+  stackChangeBanner.style.display = 'none';
+});
 
 // ─── Tab switching ─────────────────────────────────────────────────────────────
 document.querySelectorAll('.tab').forEach(tab => {
@@ -1595,6 +2376,105 @@ document.querySelectorAll('.tab').forEach(tab => {
     tab.classList.add('active');
     document.getElementById('tab-' + tab.dataset.tab).classList.add('active');
   });
+});
+
+// ─── Chat ──────────────────────────────────────────────────────────────────────
+
+function chatSend() {
+  const text = chatInput.value.trim();
+  if (!text || chatReplying || !chatReady) { return; }
+  chatInput.value = '';
+  chatInput.style.height = 'auto';
+  appendChatBubble('user', text);
+  startChatReply();
+  vscode.postMessage({ type: 'chat', chatMessage: text });
+}
+
+function startChatReply() {
+  chatReplying = true;
+  chatReplyBuf = '';
+  btnChatSend.style.display = 'none';
+  btnChatStop.style.display = 'inline-flex';
+  chatInput.disabled = true;
+  btnChatClear.disabled = true;
+  // Placeholder bubble that we'll fill in as chunks arrive
+  const wrap = document.createElement('div');
+  wrap.className = 'chat-msg-wrap assistant';
+  wrap.id = 'chat-pending-wrap';
+  const label = document.createElement('div');
+  label.className = 'chat-role-label';
+  label.textContent = 'Assistant';
+  const bubble = document.createElement('div');
+  bubble.className = 'chat-bubble assistant';
+  bubble.id = 'chat-pending-bubble';
+  bubble.innerHTML = \`<div class="chat-typing"><div class="dot-pulse"><span></span><span></span><span></span></div> Thinking…</div>\`;
+  wrap.appendChild(label);
+  wrap.appendChild(bubble);
+  chatThread.appendChild(wrap);
+  chatThread.scrollTop = chatThread.scrollHeight;
+}
+
+function stopChatReply() {
+  chatReplying = false;
+  btnChatSend.style.display = 'inline-flex';
+  btnChatStop.style.display = 'none';
+  chatInput.disabled = false;
+  btnChatClear.disabled = false;
+  chatInput.focus();
+  // Remove pending bubble if it was never filled
+  const pending = document.getElementById('chat-pending-wrap');
+  if (pending && !chatReplyBuf) { pending.remove(); }
+}
+
+function appendChatBubble(role, text) {
+  const wrap = document.createElement('div');
+  wrap.className = \`chat-msg-wrap \${role}\`;
+  const label = document.createElement('div');
+  label.className = 'chat-role-label';
+  label.textContent = role === 'user' ? 'You' : 'Assistant';
+  const bubble = document.createElement('div');
+  bubble.className = \`chat-bubble \${role}\`;
+  bubble.innerHTML = role === 'user' ? escapeHtml(text) : parseMarkdown(text);
+  wrap.appendChild(label);
+  wrap.appendChild(bubble);
+  chatThread.appendChild(wrap);
+  chatThread.scrollTop = chatThread.scrollHeight;
+}
+
+function enableChat() {
+  chatReady = true;
+  chatInput.disabled = false;
+  btnChatSend.disabled = false;
+  btnChatClear.disabled = false;
+  chatHint.textContent = 'Ask anything about the migration plan. Shift+Enter for new line.';
+}
+
+btnChatSend.addEventListener('click', chatSend);
+
+btnChatStop.addEventListener('click', () => {
+  vscode.postMessage({ type: 'stopGeneration' });
+  stopChatReply();
+});
+
+btnChatClear.addEventListener('click', () => {
+  chatThread.innerHTML = '';
+  chatReplyBuf = '';
+  stackChangeBanner.style.display = 'none';
+  planPatchIndicator.style.display = 'none';
+  vscode.postMessage({ type: 'clearChat' });
+});
+
+chatInput.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    chatSend();
+  }
+});
+
+// Auto-resize textarea
+chatInput.addEventListener('input', () => {
+  chatInput.style.height = 'auto';
+  chatInput.style.height = Math.min(chatInput.scrollHeight, 120) + 'px';
 });
 
 // ─── Model Picker (enhancement #10) ───────────────────────────────────────────
@@ -1612,10 +2492,19 @@ btnSettings.addEventListener('click', () => vscode.postMessage({ type: 'openSett
 
 // ─── Token Validation (enhancement #12) ──────────────────────────────────────
 btnValidateToken.addEventListener('click', () => {
+  const tok = inputToken.value.trim();
+  if (!tok) {
+    tokenStatus.style.display = 'block';
+    tokenStatus.style.color = 'var(--vscode-errorForeground)';
+    tokenStatus.textContent = '\u274c Enter a token first.';
+    return;
+  }
+  btnValidateToken.disabled = true;
+  btnValidateToken.textContent = '\u23f3';
   tokenStatus.style.display = 'block';
   tokenStatus.style.color = 'var(--vscode-descriptionForeground)';
-  tokenStatus.textContent = 'Verifying…';
-  vscode.postMessage({ type: 'validateToken', githubToken: inputToken.value.trim() || undefined });
+  tokenStatus.textContent = 'Verifying\u2026';
+  vscode.postMessage({ type: 'validateToken', githubToken: tok, repoUrl: inputRepo.value.trim() || undefined });
 });
 
 // ─── Save as .md (enhancement #2) ─────────────────────────────────────────────
@@ -1667,6 +2556,29 @@ btnAnalyze.addEventListener('click', () => {
   btnGenerate.disabled = true;
   lastRepoUrl = repoUrl;
   vscode.postMessage({ type: 'analyze', repoUrl, githubToken: inputToken.value.trim() || undefined });
+});
+
+// ─── Stack Health ─────────────────────────────────────────────────────────────
+btnHealth.addEventListener('click', () => {
+  hideError();
+  healthSection.style.display = 'block';
+  healthLoading.style.display = 'block';
+  healthSummary.style.display = 'none';
+  healthCards.innerHTML = '';
+  stackHealthMarkdown = '';
+  btnHealth.disabled = true;
+  vscode.postMessage({ type: 'analyzeStackHealth' });
+});
+
+// ─── Suggest Targets ──────────────────────────────────────────────────────────
+btnSuggest.addEventListener('click', () => {
+  hideError();
+  recsSection.style.display = 'block';
+  recsLoading.style.display = 'block';
+  recsCards.innerHTML = '';
+  stackRecsMarkdown = '';
+  btnSuggest.disabled = true;
+  vscode.postMessage({ type: 'recommendStacks' });
 });
 
 // ─── Generate ─────────────────────────────────────────────────────────────────
@@ -1753,10 +2665,71 @@ btnCopyExport.addEventListener('click', () => {
 
 btnCloseExport.addEventListener('click', () => { exportOutputWrap.style.display = 'none'; });
 
+// ─── Jira Stories ──────────────────────────────────────────────────────────────
+btnJiraStories.addEventListener('click', () => {
+  jiraConfigModal.style.display = 'flex';
+});
+
+jiraConfigCancel.addEventListener('click', () => {
+  jiraConfigModal.style.display = 'none';
+});
+
+jiraConfigGo.addEventListener('click', () => {
+  const teamSize = parseInt(jiraTeamSizeInput.value, 10) || 4;
+  const roles = Array.from(document.querySelectorAll('.jira-role-cb'))
+    .filter(cb => cb.checked)
+    .map(cb => cb.value);
+  if (roles.length === 0) { roles.push('Developer'); }
+
+  jiraConfigModal.style.display = 'none';
+  jiraMarkdown = '';
+  jiraCsvContent = '';
+  jiraOutputWrap.style.display = 'flex';
+  jiraOutput.textContent = 'Generating Jira stories...';
+  btnJiraStories.disabled = true;
+  btnCsvJira.disabled = true;
+
+  const targetStack = inputTarget.value.trim() || 'modern stack';
+  vscode.postMessage({
+    type: 'generateJiraStories',
+    targetStack,
+    jiraConfig: { teamSize, sprintWeeks: 2, roles },
+  });
+});
+
+btnCopyJira.addEventListener('click', () => {
+  navigator.clipboard.writeText(jiraMarkdown).then(() => {
+    btnCopyJira.textContent = 'Copied!';
+    setTimeout(() => { btnCopyJira.textContent = 'Copy Markdown'; }, 2000);
+  });
+});
+
+btnCsvJira.addEventListener('click', () => {
+  if (!jiraCsvContent) { return; }
+  const blob = new Blob([jiraCsvContent], { type: 'text/csv' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'migration-jira-stories.csv';
+  a.click();
+  URL.revokeObjectURL(url);
+});
+
+btnCloseJira.addEventListener('click', () => { jiraOutputWrap.style.display = 'none'; });
+
 // ─── Download Report ──────────────────────────────────────────────────────────
+const reportFormatPlaceholder = reportFormatSel.options[0]; // −0 option = placeholder label
 reportFormatSel.addEventListener('change', () => {
   const fmt = reportFormatSel.value;
   if (!fmt) { return; }
+  reportFormatSel.value = '';           // reset immediately so re-selection is possible
+  reportFormatSel.disabled = true;
+  reportFormatPlaceholder.textContent = '\u23f3 Generating...';
+  // Show + scroll the progress bar into view so the user can see activity
+  progressBar.style.width = '5%';
+  progressText.textContent = 'Preparing detailed report via Copilot...';
+  progressSect.style.display = 'block';
+  progressSect.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
   const targetStack = inputTarget.value.trim() || 'modern stack';
   vscode.postMessage({ type: 'generateReport', targetStack, reportFormat: fmt });
 });
@@ -1803,6 +2776,20 @@ window.addEventListener('message', (event) => {
       if (msg.settings.copilotModel) { modelPicker.value = msg.settings.copilotModel; }
       break;
 
+    case 'modelsLoaded': {
+      // Rebuild dropdown with live Copilot-available models; preserve current selection
+      const currentModel = modelPicker.value;
+      modelPicker.innerHTML = msg.models.map(m =>
+        \`<option value="\${m}"\${m === currentModel ? ' selected' : ''}>\${m}</option>\`
+      ).join('');
+      // If saved model isn't in the live list, add it so the selection stays valid
+      if (!msg.models.includes(currentModel) && currentModel) {
+        modelPicker.insertAdjacentHTML('afterbegin',
+          \`<option value="\${currentModel}" selected>\${currentModel}</option>\`);
+      }
+      break;
+    }
+
     case 'progress':
       progressBar.style.width = ((msg.step / msg.totalSteps) * 100) + '%';
       progressText.textContent = msg.message;
@@ -1816,7 +2803,14 @@ window.addEventListener('message', (event) => {
       renderFileTree(msg.analysis);
       renderSecurityReport(msg.analysis);
       btnGenerate.disabled = false;
+      btnSuggest.disabled = false;
       btnRunQueue.disabled = !inputTarget.value.trim() || !queueInput.value.trim();
+      // Show preset loading spinner while AI generates options in background
+      presetLoading.style.display = 'inline-flex';
+      presetAiBadge.style.display = 'none';
+      // Kick off AI stack enrichment automatically
+      showStackLoading(true);
+      vscode.postMessage({ type: 'aiDetectStack' });
       break;
 
     case 'cacheHit': {
@@ -1825,6 +2819,35 @@ window.addEventListener('message', (event) => {
       cacheNotice.querySelector('span') && (cacheNotice.querySelector('span').textContent = \`\${ago}m ago\`);
       break;
     }
+
+    // AI-generated presets arrived — replace the static dropdown options
+    case 'presetsReady': {
+      presetLoading.style.display = 'none';
+      if (!msg.presets || msg.presets.length === 0) { break; }
+      // Keep the placeholder option, replace everything else
+      presetSelect.innerHTML = '<option value="">— AI-suggested presets —</option>';
+      const effortOrder = ['Low', 'Medium', 'High', 'Very High'];
+      const sorted = [...msg.presets].sort(
+        (a, b) => effortOrder.indexOf(a.effort) - effortOrder.indexOf(b.effort)
+      );
+      const group = document.createElement('optgroup');
+      group.label = '✨ Tailored for this repo';
+      sorted.forEach(p => {
+        const opt = document.createElement('option');
+        opt.value = p.targetStack;
+        opt.title = p.rationale || '';
+        opt.textContent = \`[\${p.effort}] \${p.title}\`;
+        group.appendChild(opt);
+      });
+      presetSelect.appendChild(group);
+      presetAiBadge.style.display = 'inline';
+      break;
+    }
+
+    // Preset generation failed — keep static options, hide spinner
+    case 'presetsError':
+      presetLoading.style.display = 'none';
+      break;
 
     case 'planChunk':
       if (msg.chunk === '') {
@@ -1846,6 +2869,8 @@ window.addEventListener('message', (event) => {
       stopGeneration(false);
       btnSaveMd.disabled = false;
       btnPreviews.disabled = false;
+      btnJiraStories.disabled = false;
+      enableChat();
       break;
 
     case 'planSaved':
@@ -1942,19 +2967,273 @@ window.addEventListener('message', (event) => {
       progressIndicator.style.display = 'none';
       break;
 
+    // AI stack detection
+    case 'aiStackDetected':
+      showStackLoading(false);
+      if (msg.aiStack) { renderAIStack(msg.aiStack, analysisData); }
+      break;
+
+    // Stack health analysis
+    case 'stackHealthChunk':
+      if (msg.chunk === '') { stackHealthMarkdown = ''; }
+      else { stackHealthMarkdown += msg.chunk; }
+      break;
+    case 'stackHealthComplete':
+      healthLoading.style.display = 'none';
+      btnHealth.disabled = false;
+      renderHealthCards(stackHealthMarkdown);
+      break;
+
+    // Stack recommendations
+    case 'stackRecsChunk':
+      if (msg.chunk === '') { stackRecsMarkdown = ''; }
+      else { stackRecsMarkdown += msg.chunk; }
+      break;
+    case 'stackRecsComplete':
+      recsLoading.style.display = 'none';
+      btnSuggest.disabled = false;
+      renderRecCards(stackRecsMarkdown);
+      break;
+
     // Report generation
     case 'reportReady':
       reportFormatSel.value = '';
+      reportFormatSel.disabled = false;
+      reportFormatPlaceholder.textContent = '\u2b07 Report...';
+      progressSect.style.display = 'none';
       showInfoMsg('Report saved: ' + msg.message);
       break;
     case 'reportError':
       reportFormatSel.value = '';
+      reportFormatSel.disabled = false;
+      reportFormatPlaceholder.textContent = '\u2b07 Report...';
+      progressSect.style.display = 'none';
       showError('Report error: ' + msg.message);
       break;
+
+    // Jira stories generation
+    case 'jiraStoriesChunk':
+      if (msg.chunk) {
+        jiraMarkdown += msg.chunk;
+        jiraOutput.innerHTML = parseMarkdown(jiraMarkdown);
+        jiraOutput.scrollTop = jiraOutput.scrollHeight;
+      }
+      break;
+    case 'jiraStoriesComplete':
+      btnJiraStories.disabled = false;
+      btnCsvJira.disabled = false;
+      break;
+    case 'jiraStoriesCsv':
+      jiraCsvContent = msg.csvContent || '';
+      break;
+
+    // Chat
+    case 'chatChunk':
+      if (msg.chunk === '') {
+        // New assistant turn starting — pending bubble already added by startChatReply()
+        chatReplyBuf = '';
+      } else {
+        chatReplyBuf += msg.chunk;
+        const bubble = document.getElementById('chat-pending-bubble');
+        if (bubble) {
+          bubble.innerHTML = parseMarkdown(chatReplyBuf) + \`<span class="cursor"></span>\`;
+          chatThread.scrollTop = chatThread.scrollHeight;
+        }
+      }
+      break;
+
+    case 'chatComplete': {
+      const bubble = document.getElementById('chat-pending-bubble');
+      if (bubble) {
+        bubble.removeAttribute('id');
+        bubble.innerHTML = parseMarkdown(chatReplyBuf);
+      }
+      const wrap = document.getElementById('chat-pending-wrap');
+      if (wrap) { wrap.removeAttribute('id'); }
+      stopChatReply();
+      chatThread.scrollTop = chatThread.scrollHeight;
+      break;
+    }
+
+    case 'chatCleared':
+      // Already cleared by button handler
+      break;
+
+    // Stack component swap detected in chat
+    case 'stackChangeDetected': {
+      const intent = msg.stackChangeIntent;
+      if (!intent) { break; }
+      stackChangeTitle.textContent =
+        \`Apply stack change: \${intent.fromComponent} → \${intent.toComponent}?\`;
+      if (intent.reason) {
+        stackChangeReason.textContent = \`Reason: \${intent.reason}\`;
+        stackChangeReason.style.display = 'block';
+      } else {
+        stackChangeReason.style.display = 'none';
+      }
+      stackChangeBanner.style.display = 'flex';
+      // Auto-scroll the chat tab so the banner is visible
+      stackChangeBanner.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+      break;
+    }
+
+    // Plan is being rewritten section-by-section
+    case 'planPatchChunk':
+      if (msg.chunk === '') {
+        planMarkdown = '';
+        planRendered.innerHTML = '';
+        planOutput.textContent = '';
+      } else {
+        planMarkdown += msg.chunk;
+        planRendered.innerHTML = parseMarkdown(planMarkdown);
+        planOutput.textContent = planMarkdown;
+        planRendered.scrollTop = planRendered.scrollHeight;
+      }
+      break;
+
+    // Plan patch complete — update status and switch to plan tab
+    case 'planPatchComplete': {
+      planPatchIndicator.style.display = 'none';
+      if (msg.patchedPlan) {
+        planMarkdown = msg.patchedPlan;
+        planRendered.innerHTML = parseMarkdown(planMarkdown);
+        planOutput.textContent = planMarkdown;
+      }
+      // Append a confirmation bubble so the user knows the plan was updated
+      const note = document.createElement('div');
+      note.className = 'chat-msg-wrap assistant';
+      const noteBubble = document.createElement('div');
+      noteBubble.className = 'chat-bubble assistant';
+      noteBubble.style.background = 'var(--vscode-inputValidation-infoBackground, #1e3a4a)';
+      noteBubble.style.borderLeft = '3px solid var(--vscode-inputValidation-infoBorder, #2196f3)';
+      noteBubble.textContent = '✅ Migration plan has been updated. Switch to the Plan tab to review the changes.';
+      note.appendChild(noteBubble);
+      chatThread.appendChild(note);
+      chatThread.scrollTop = chatThread.scrollHeight;
+      break;
+    }
   }
 });
 
 // ─── UI Helpers ───────────────────────────────────────────────────────────────
+
+// ─── Health Cards ─────────────────────────────────────────────────────────────
+
+function renderHealthCards(markdown) {
+  healthCards.innerHTML = '';
+
+  // Extract and show the summary line
+  const summaryMatch = markdown.match(/\*\*Health Score:.*?\*\*[^\n]*/);
+  if (summaryMatch) {
+    healthSummary.style.display = 'block';
+    healthSummary.innerHTML = parseMarkdown(summaryMatch[0]);
+  }
+
+  // Split into issue sections by "## " headings
+  const sections = markdown.split(/(?=## )/g).filter(s => s.startsWith('## '));
+
+  sections.forEach(section => {
+    const titleMatch = section.match(/## (.+)/);
+    if (!titleMatch) { return; }
+    const title = titleMatch[1].trim();
+
+    const impactMatch = section.match(/\*\*Impact:\*\*\s*(High|Medium|Low)/i);
+    const impact = impactMatch ? impactMatch[1].toLowerCase() : 'medium';
+
+    const problemMatch = section.match(/\*\*Problem:\*\*\s*([^\n]+)/i);
+    const problem = problemMatch ? problemMatch[1].trim() : '';
+
+    const fixMatch = section.match(/\*\*Fix:\*\*\s*([^\n]+)/i);
+    const fix = fixMatch ? fixMatch[1].trim() : '';
+
+    const card = document.createElement('div');
+    card.className = \`health-card impact-\${impact}\`;
+    card.innerHTML = \`
+      <div class="health-card-title">
+        \${escapeHtml(title)}<span class="health-impact">\${escapeHtml(impact.toUpperCase())}</span>
+      </div>
+      \${problem ? \`<div class="health-problem">\${escapeHtml(problem)}</div>\` : ''}
+      \${fix ? \`<div class="health-fix">\${escapeHtml(fix)}</div>\` : ''}
+    \`;
+    healthCards.appendChild(card);
+  });
+
+  if (healthCards.children.length === 0) {
+    healthCards.innerHTML = \`<div class="rec-body">\${parseMarkdown(markdown)}</div>\`;
+  }
+}
+
+// ─── Recommendation Cards ──────────────────────────────────────────────────────
+
+function renderRecCards(markdown) {
+  recsCards.innerHTML = '';
+  // Split by "## Option" headings
+  const sections = markdown.split(/(?=## Option \d+:)/g).filter(s => s.trim());
+
+  sections.forEach(section => {
+    // Extract title
+    const titleMatch = section.match(/## Option \d+:\s*(.+)/);
+    if (!titleMatch) { return; }
+    const title = titleMatch[1].trim();
+
+    // Extract effort
+    const effortMatch = section.match(/\*\*Effort:\*\*\s*(.+)/i);
+    const effort = effortMatch ? effortMatch[1].trim() : '';
+
+    // Extract best for
+    const bestForMatch = section.match(/\*\*Best for:\*\*\s*(.+)/i);
+    const bestFor = bestForMatch ? bestForMatch[1].trim() : '';
+
+    // Extract [TARGET]: line
+    const targetMatch = section.match(/\[TARGET\]:\s*(.+)/i);
+    const target = targetMatch ? targetMatch[1].trim() : '';
+
+    // Extract pros/cons block (between Best for and [TARGET])
+    let body = section
+      .replace(/## Option \d+:.+/g, '')
+      .replace(/\*\*Effort:\*\*.*\n?/g, '')
+      .replace(/\*\*Best for:\*\*.*\n?/g, '')
+      .replace(/\[TARGET\]:.*/g, '')
+      .trim();
+
+    // Build effort badge class
+    const effortLower = effort.toLowerCase().replace(/\s+/g, '-');
+    const effortClass = ['low','medium','high','very-high'].includes(effortLower)
+      ? \`effort-\${effortLower}\`
+      : 'effort-medium';
+
+    const card = document.createElement('div');
+    card.className = 'rec-card';
+    card.innerHTML = \`
+      <div class="rec-card-header">
+        <span class="rec-title">\${escapeHtml(title)}</span>
+        \${effort ? \`<span class="effort-badge \${effortClass}">\${escapeHtml(effort)} effort</span>\` : ''}
+      </div>
+      \${bestFor ? \`<p class="rec-bestfor">\${escapeHtml(bestFor)}</p>\` : ''}
+      <div class="rec-body">\${parseMarkdown(body)}</div>
+      \${target ? \`<button class="btn btn-primary rec-use-btn" data-target="\${escapeHtml(target)}">→ Use This Target</button>\` : ''}
+    \`;
+
+    if (target) {
+      card.querySelector('.rec-use-btn').addEventListener('click', () => {
+        inputTarget.value = target;
+        inputTarget.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        inputTarget.focus();
+      });
+    }
+
+    recsCards.appendChild(card);
+  });
+
+  if (recsCards.children.length === 0) {
+    // Fallback: render raw markdown if parsing failed
+    recsCards.innerHTML = \`<div class="rec-body">\${parseMarkdown(markdown)}</div>\`;
+  }
+}
+
+function escapeHtml(str) {
+  return str.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
 
 function showInfoMsg(text) {
   errorBox.className = 'msg-info';
@@ -2125,6 +3404,38 @@ function renderStack(analysis) {
 
 function row(key, val) {
   return \`<div class="stack-row"><span class="stack-key">\${key}</span><span class="stack-val">\${escapeHtml(String(val))}</span></div>\`;
+}
+
+function showStackLoading(show) {
+  stackAiLoading.style.display = show ? 'block' : 'none';
+}
+
+function renderAIStack(ai, analysis) {
+  const info = analysis?.repoInfo || {};
+  stackCard.innerHTML = [
+    info.owner ? row('Repo', \`\${info.owner}/\${info.repo}\`) : '',
+    row('Language',    ai.primaryLanguage),
+    row('Runtime',     ai.currentVersion || ai.runtime),
+    row('Framework',   ai.framework),
+    row('Build Tool',  ai.buildTool),
+    row('Pkg Manager', ai.packageManager),
+    row('CI/CD',       ai.ciSystem || 'None'),
+    row('Docker',      ai.containerized ? '✅ Yes' : '❌ No'),
+    ai.databases?.length        ? row('Databases', ai.databases.join(', '))         : '',
+    ai.testingFrameworks?.length ? row('Tests',    ai.testingFrameworks.join(', '))  : '',
+    info.totalFiles ? row('Files', info.totalFiles.toLocaleString()) : '',
+    info.stars !== undefined ? row('Stars', '⭐ ' + info.stars.toLocaleString()) : '',
+    ai.insights ? \`<div class="stack-row" style="flex-direction:column;gap:2px">
+      <span class="stack-key" style="margin-bottom:2px">AI Insights</span>
+      <span class="stack-val" style="text-align:left;font-weight:400;opacity:0.85;font-size:10.5px">\${escapeHtml(ai.insights)}</span>
+    </div>\` : '',
+  ].filter(Boolean).join('');
+  // Mark card as AI-enriched with a subtle badge
+  stackCard.style.position = 'relative';
+  const badge = document.createElement('div');
+  badge.style.cssText = 'position:absolute;top:6px;right:8px;font-size:9px;font-weight:700;padding:1px 5px;border-radius:6px;background:var(--vscode-badge-background);color:var(--vscode-badge-foreground);opacity:0.8';
+  badge.textContent = '✨ AI';
+  stackCard.appendChild(badge);
 }
 
 function renderFileTree(analysis) {

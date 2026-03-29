@@ -3,6 +3,7 @@
 export interface RepoInfo {
   owner: string;
   repo: string;
+  hostname: string;        // e.g. "github.com" or "github.yourcompany.com"
   defaultBranch: string;
   description: string;
   language: string;
@@ -70,7 +71,14 @@ export type WebviewMessageType =
   | 'checkProgress'
   | 'generateFilePreviews'
   | 'getExecSummary'
-  | 'generateReport';
+  | 'generateReport'
+  | 'recommendStacks'
+  | 'analyzeStackHealth'
+  | 'aiDetectStack'
+  | 'chat'
+  | 'clearChat'
+  | 'applyStackChange'
+  | 'generateJiraStories';
 
 export interface WebviewMessage {
   type: WebviewMessageType;
@@ -87,6 +95,8 @@ export interface WebviewMessage {
   orgUrl?: string;         // for analyzeOrg
   branch?: string;         // for checkProgress
   reportFormat?: 'word' | 'html'; // for generateReport
+  chatMessage?: string;    // for chat
+  jiraConfig?: JiraStoriesConfig; // for generateJiraStories
 }
 
 export interface AnalysisOptions {
@@ -135,6 +145,20 @@ export interface BranchDiff {
 
 export type ExportFormat = 'checklist' | 'github-issue' | 'exec-summary' | 'confluence';
 
+// ─── Stack Change Intent ────────────────────────────────────────────────────
+
+/** Parsed intent when a chat message requests swapping one stack component */
+export interface StackChangeIntent {
+  /** The component being replaced, e.g. "Redux", "Jest", "MySQL" */
+  fromComponent: string;
+  /** The replacement, e.g. "Zustand", "Vitest", "PostgreSQL" */
+  toComponent: string;
+  /** Short reason the user supplied, or empty string */
+  reason: string;
+  /** Sections of the plan (heading text) that reference fromComponent */
+  affectedSections: string[];
+}
+
 export type ExtensionMessageType =
   | 'progress'
   | 'analysisComplete'
@@ -160,7 +184,24 @@ export type ExtensionMessageType =
   | 'execSummaryChunk'
   | 'execSummaryComplete'
   | 'reportReady'
-  | 'reportError';
+  | 'reportError'
+  | 'stackRecsChunk'
+  | 'stackRecsComplete'
+  | 'stackHealthChunk'
+  | 'stackHealthComplete'
+  | 'aiStackDetected'
+  | 'chatChunk'
+  | 'chatComplete'
+  | 'chatCleared'
+  | 'stackChangeDetected'
+  | 'planPatchChunk'
+  | 'planPatchComplete'
+  | 'presetsReady'
+  | 'presetsError'
+  | 'modelsLoaded'
+  | 'jiraStoriesChunk'
+  | 'jiraStoriesComplete'
+  | 'jiraStoriesCsv';
 
 export interface ExtensionMessage {
   type: ExtensionMessageType;
@@ -180,6 +221,29 @@ export interface ExtensionMessage {
   exportContent?: string;
   exportFormat?: ExportFormat;
   dashboard?: OrgDashboard;
+  aiStack?: AIDetectedStack;
+  stackChangeIntent?: StackChangeIntent;   // for stackChangeDetected
+  patchedPlan?: string;                    // for planPatchComplete — full updated plan
+  presets?: MigrationPreset[];             // for presetsReady
+  models?: string[];                        // for modelsLoaded
+  jiraStories?: JiraStory[];                // for jiraStoriesComplete
+  csvContent?: string;                      // for jiraStoriesCsv
+}
+
+// ─── AI Stack Detection ───────────────────────────────────────────────────────
+
+export interface AIDetectedStack {
+  primaryLanguage: string;
+  framework: string;
+  runtime: string;
+  buildTool: string;
+  packageManager: string;
+  currentVersion: string;
+  containerized: boolean;
+  ciSystem: string;
+  databases: string[];
+  testingFrameworks: string[];
+  insights: string; // extra observations that don't fit structured fields
 }
 
 // ─── Cache & History Types ────────────────────────────────────────────────────
@@ -198,6 +262,7 @@ export interface HistoryEntry {
   targetStack: string;
   timestamp: number;
   plan: string; // full markdown
+  analysis?: RepoAnalysis; // stored so history loads can restore context-dependent features
 }
 
 // ─── Migration Plan Types ─────────────────────────────────────────────────────
@@ -206,4 +271,56 @@ export interface MigrationRequest {
   analysis: RepoAnalysis;
   targetStack: string;
   options: AnalysisOptions;
+}
+
+// ─── Migration Preset Types ───────────────────────────────────────────────────
+
+export interface MigrationPreset {
+  id: string;
+  title: string;
+  targetStack: string;
+  effort: 'Low' | 'Medium' | 'High' | 'Very High';
+  rationale: string;
+  pros: string[];
+  cons: string[];
+}
+
+// ─── Chat Types ───────────────────────────────────────────────────────────────
+
+export interface ChatMessage {
+  role: 'user' | 'assistant';
+  content: string;
+  timestamp: number;
+}
+
+// ─── Jira Story Generation Types ──────────────────────────────────────────────
+
+export interface JiraStory {
+  epicKey: string;         // e.g. "MIGRATION-E1"
+  epicName: string;        // e.g. "Foundation Setup"
+  storyId: string;         // e.g. "MIGRATION-101"
+  summary: string;         // Jira summary field
+  description: string;     // detailed description
+  storyPoints: number;     // Fibonacci: 1,2,3,5,8,13
+  priority: 'Critical' | 'High' | 'Medium' | 'Low';
+  sprint: string;          // e.g. "Sprint 1 — Foundation"
+  sprintNumber: number;    // 1-based
+  labels: string[];        // e.g. ["migration", "backend"]
+  estimatedDays: number;   // calendar days
+  component: string;       // area of the codebase
+  acceptanceCriteria: string;
+  suggestions: string;     // AI tips / gotchas
+}
+
+export interface JiraStoriesConfig {
+  teamSize: number;
+  sprintWeeks: number;     // typically 2
+  roles: string[];         // e.g. ["Senior Dev", "Junior Dev", "QA", "DevOps"]
+}
+
+export interface JiraStoriesResult {
+  stories: JiraStory[];
+  totalPoints: number;
+  estimatedSprints: number;
+  summary: string;         // markdown overview
 }

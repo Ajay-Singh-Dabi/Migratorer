@@ -888,6 +888,8 @@ export function generateHtmlReport(
     .main-content { margin-left: 0; padding: 24px; }
   }
 </style>
+<!-- Prism.js syntax highlighting (dark theme matching code block bg) -->
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css">
 </head>
 <body>
 <div class="page-wrapper">
@@ -937,6 +939,9 @@ ${html}
 
 </main>
 </div>
+<!-- Prism.js autoloader: fetches grammar for each detected language -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-core.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/plugins/autoloader/prism-autoloader.min.js"></script>
 </body>
 </html>`;
 }
@@ -1009,7 +1014,7 @@ function markdownToHtml(md: string): string {
         <div class="code-dots"><div class="code-dot red"></div><div class="code-dot yellow"></div><div class="code-dot green"></div></div>
         ${lang ? `<span class="code-lang-tag">${esc(lang)}</span>` : ''}
       </div>`;
-      out.push(`<div class="code-wrap">${header}<pre><code>${codeLines.join('\n')}</code></pre></div>`);
+      out.push(`<div class="code-wrap">${header}<pre><code${lang ? ` class="language-${esc(lang)}"` : ''}>${codeLines.join('\n')}</code></pre></div>`);
       i++; continue;
     }
 

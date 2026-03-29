@@ -38,7 +38,6 @@ exports.analyzeRepository = analyzeRepository;
 exports.parseOrgUrl = parseOrgUrl;
 exports.analyzeOrg = analyzeOrg;
 exports.fetchBranchDiff = fetchBranchDiff;
-const https = __importStar(require("https"));
 const vscode = __importStar(require("vscode"));
 // ─── Secret Redaction ─────────────────────────────────────────────────────────
 // Files that must never be fetched — too likely to contain raw secrets
@@ -110,49 +109,31 @@ function resolveApiTarget(hostname, path) {
     // GitHub Enterprise Server
     return { hostname, fullPath: `/api/v3${path}` };
 }
-function githubGet(path, token, hostname = 'github.com') {
-    return new Promise((resolve, reject) => {
-        const { hostname: apiHost, fullPath } = resolveApiTarget(hostname, path);
-        const options = {
-            hostname: apiHost,
-            path: fullPath,
-            method: 'GET',
-            headers: {
-                'User-Agent': 'vscode-migration-assistant/1.0',
-                'Accept': 'application/vnd.github+json',
-                ...(token ? { Authorization: `Bearer ${token}` } : {}),
-            },
-        };
-        const req = https.request(options, (res) => {
-            let data = '';
-            res.on('data', (chunk) => (data += chunk));
-            res.on('end', () => {
-                if (res.statusCode === 404) {
-                    reject(new Error(`Repository not found or not accessible (404). If it's private, provide a GitHub token.`));
-                    return;
-                }
-                if (res.statusCode === 403) {
-                    reject(new Error(`GitHub API rate limit exceeded (403). Provide a GitHub token to increase limits.`));
-                    return;
-                }
-                if (res.statusCode && res.statusCode >= 400) {
-                    reject(new Error(`GitHub API error: ${res.statusCode} - ${data}`));
-                    return;
-                }
-                try {
-                    resolve(JSON.parse(data));
-                }
-                catch {
-                    reject(new Error(`Failed to parse GitHub API response`));
-                }
-            });
-        });
-        req.on('error', reject);
-        req.setTimeout(15000, () => {
-            req.destroy(new Error('GitHub API request timed out'));
-        });
-        req.end();
-    });
+async function githubGet(path, token, hostname = 'github.com') {
+    const { hostname: apiHost, fullPath } = resolveApiTarget(hostname, path);
+    const url = `https://${apiHost}${fullPath}`;
+    const headers = {
+        'User-Agent': 'vscode-migration-assistant/1.0',
+        'Accept': 'application/vnd.github+json',
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    };
+    const res = await fetch(url, { headers });
+    const text = await res.text();
+    if (res.status === 404) {
+        throw new Error(`Repository not found or not accessible (404). If it's private, provide a GitHub token.`);
+    }
+    if (res.status === 403) {
+        throw new Error(`GitHub API rate limit exceeded (403). Provide a GitHub token to increase limits.`);
+    }
+    if (res.status >= 400) {
+        throw new Error(`GitHub API error: ${res.status} - ${text}`);
+    }
+    try {
+        return JSON.parse(text);
+    }
+    catch {
+        throw new Error(`Failed to parse GitHub API response`);
+    }
 }
 // ─── URL Parser ───────────────────────────────────────────────────────────────
 function parseGitHubUrl(url) {
@@ -174,6 +155,7 @@ async function fetchRepoInfo(owner, repo, token, hostname = 'github.com') {
     return {
         owner,
         repo,
+        hostname,
         defaultBranch: data.default_branch || 'main',
         description: data.description || '',
         language: data.language || 'Unknown',
