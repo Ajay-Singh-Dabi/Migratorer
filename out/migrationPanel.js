@@ -39,7 +39,7 @@ const path = __importStar(require("path"));
 const githubAnalyzer_1 = require("./githubAnalyzer");
 const copilotService_1 = require("./copilotService");
 const reportGenerator_1 = require("./reportGenerator");
-const CACHE_KEY = 'migrationAssistant.analysisCache';
+const CACHE_KEY = 'migrationAssistant.analysisCache.v4';
 const HISTORY_KEY = 'migrationAssistant.history';
 const MAX_HISTORY = 8;
 const CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutes
@@ -66,6 +66,7 @@ class MigrationPanel {
     constructor(panel, extensionUri, secrets, globalState) {
         this._disposables = [];
         this._lastPlan = '';
+        this._lastTargetStack = '';
         this._chatHistory = [];
         this._panel = panel;
         this._extensionUri = extensionUri;
@@ -183,7 +184,7 @@ class MigrationPanel {
                 break;
             // User confirmed they want to apply the detected stack swap to the plan
             case 'applyStackChange':
-                await this.applyPendingPlanPatch();
+                await this.applyPendingPlanPatch(msg.regenerate === true);
                 break;
             case 'openSettings':
                 vscode.commands.executeCommand('workbench.action.openSettings', 'migrationAssistant');
@@ -272,7 +273,21 @@ class MigrationPanel {
         this._cancellationSource?.cancel();
         this._cancellationSource = new vscode.CancellationTokenSource();
         const token = this._cancellationSource.token;
+        // ── Chunked full-codebase analysis ────────────────────────────────────────
+        // Analyse ALL fetched source files in groups of 10 before generating the
+        // plan, so every section knows about the whole codebase — not just samples.
+        const sourceFileCount = analysis.keyFiles.filter((f) => f.type === 'source').length;
+        if (sourceFileCount > 0) {
+            const chunkTotal = Math.ceil(sourceFileCount / 10);
+            this._post({ type: 'progress', message: `Analysing ${sourceFileCount} source files in ${chunkTotal} groups…`, step: 1, totalSteps: chunkTotal + 1 });
+            const chunkSummaries = await (0, copilotService_1.analyzeFilesInChunks)(analysis, (msg, done, total) => this._post({ type: 'progress', message: msg, step: done + 1, totalSteps: total + 1 }), token);
+            analysis = { ...analysis, chunkSummaries };
+            this._lastAnalysis = analysis; // update so re-runs use the enriched version
+        }
+        // ─────────────────────────────────────────────────────────────────────────
         this._lastPlan = '';
+        this._lastTargetStack = targetStack;
+        this._lastOptions = options;
         this._chatHistory = []; // new plan = fresh chat context
         this._post({ type: 'planChunk', chunk: '' }); // clear signal
         try {
@@ -684,7 +699,7 @@ class MigrationPanel {
         }
     }
     // ─── Apply Plan Patch ─────────────────────────────────────────────────────────
-    async applyPendingPlanPatch() {
+    async applyPendingPlanPatch(regenerate = false) {
         const intent = this._pendingStackChange;
         if (!intent || !this._lastAnalysis || !this._lastPlan) {
             this._post({ type: 'error', message: 'No pending stack change to apply.' });
@@ -693,13 +708,62 @@ class MigrationPanel {
         this._pendingStackChange = undefined;
         this._cancellationSource?.cancel();
         this._cancellationSource = new vscode.CancellationTokenSource();
+        const token = this._cancellationSource.token;
+        if (regenerate) {
+            // ── Full plan regeneration ─────────────────────────────────────────────
+            // Build an updated target stack string by substituting the old component.
+            // If the old component appears in the target string, swap it in-place;
+            // otherwise append a directive so the LLM knows about the change.
+            const baseTarget = this._lastTargetStack ||
+                vscode.workspace.getConfiguration('migrationAssistant').get('lastTargetStack', '');
+            const updatedTarget = baseTarget.toLowerCase().includes(intent.fromComponent.toLowerCase())
+                ? baseTarget.replace(new RegExp(intent.fromComponent, 'gi'), intent.toComponent)
+                : `${baseTarget} (replacing ${intent.fromComponent} with ${intent.toComponent})`;
+            const options = this._lastOptions ?? {
+                includeTestMigration: true,
+                includeCiMigration: true,
+                includeDockerMigration: true,
+                detailLevel: 'detailed',
+                phasedMode: false,
+                scope: 'full',
+            };
+            // Clear plan display and restart — chunk summaries are already cached,
+            // so skip re-fetching; go straight to plan generation.
+            this._lastPlan = '';
+            this._lastTargetStack = updatedTarget;
+            this._lastOptions = options;
+            this._chatHistory = [];
+            this._post({ type: 'planChunk', chunk: '' }); // clear signal
+            try {
+                await (0, copilotService_1.streamMigrationPlan)(this._lastAnalysis, // already has chunkSummaries from the first run
+                updatedTarget, options, (chunk) => {
+                    this._lastPlan += chunk;
+                    this._post({ type: 'planChunk', chunk });
+                }, token);
+                this._post({ type: 'planComplete' });
+                const cfg = vscode.workspace.getConfiguration('migrationAssistant');
+                await cfg.update('lastTargetStack', updatedTarget, vscode.ConfigurationTarget.Global);
+                await this._saveToHistory(this._lastAnalysis, updatedTarget, this._lastPlan);
+                this._post({ type: 'historyLoaded', entries: this._getHistory() });
+            }
+            catch (err) {
+                if (token.isCancellationRequested) {
+                    this._post({ type: 'stopped' });
+                }
+                else {
+                    this._post({ type: 'error', message: err.message || String(err) });
+                }
+            }
+            return;
+        }
+        // ── Surgical section patch (default) ──────────────────────────────────────
         // Signal the UI that the plan is being rewritten
         this._post({ type: 'planPatchChunk', chunk: '' });
         try {
             await (0, copilotService_1.streamPlanPatch)(this._lastAnalysis, this._lastPlan, intent, (chunk) => this._post({ type: 'planPatchChunk', chunk }), (patchedPlan) => {
                 this._lastPlan = patchedPlan;
                 this._post({ type: 'planPatchComplete', patchedPlan });
-            }, this._cancellationSource.token);
+            }, token);
         }
         catch (err) {
             this._post({ type: 'error', message: err.message || String(err) });
@@ -1432,7 +1496,8 @@ class MigrationPanel {
   .stack-change-banner .banner-body { flex: 1; }
   .stack-change-banner .banner-title { font-weight: 600; margin-bottom: 4px; }
   .stack-change-banner .banner-reason { color: var(--vscode-descriptionForeground); margin-bottom: 8px; font-style: italic; }
-  .stack-change-banner .banner-actions { display: flex; gap: 8px; }
+  .stack-change-banner .banner-scope-note { color: var(--vscode-editorWarning-foreground, #cca700); margin-bottom: 8px; font-size: 11px; }
+  .stack-change-banner .banner-actions { display: flex; gap: 8px; flex-wrap: wrap; }
   .stack-change-banner .banner-apply {
     background: var(--vscode-button-background);
     color: var(--vscode-button-foreground);
@@ -1440,6 +1505,11 @@ class MigrationPanel {
     padding: 4px 12px; cursor: pointer; font-size: 12px;
   }
   .stack-change-banner .banner-apply:hover { background: var(--vscode-button-hoverBackground); }
+  .stack-change-banner .banner-apply.banner-secondary {
+    background: var(--vscode-button-secondaryBackground, #3a3d41);
+    color: var(--vscode-button-secondaryForeground, #cccccc);
+  }
+  .stack-change-banner .banner-apply.banner-secondary:hover { background: var(--vscode-button-secondaryHoverBackground, #45494e); }
   .stack-change-banner .banner-dismiss {
     background: transparent;
     color: var(--vscode-descriptionForeground);
@@ -1657,9 +1727,6 @@ class MigrationPanel {
         </select>
       </div>
 
-      <label class="option-item" style="margin-top:8px">
-        <input type="checkbox" id="opt-phased"> Phased migration mode
-      </label>
 
       <button class="btn btn-primary" id="btn-generate" style="margin-top:10px" disabled>
         ✨ Generate Migration Plan
@@ -1796,8 +1863,10 @@ class MigrationPanel {
         <div class="banner-body">
           <div class="banner-title" id="stack-change-title"></div>
           <div class="banner-reason" id="stack-change-reason" style="display:none"></div>
+          <div class="banner-scope-note" id="banner-scope-note" style="display:none"></div>
           <div class="banner-actions">
-            <button class="banner-apply" id="btn-apply-stack-change">Apply to plan</button>
+            <button class="banner-apply" id="btn-apply-stack-change">Update affected sections</button>
+            <button class="banner-apply banner-secondary" id="btn-regenerate-plan" style="display:none">Regenerate full plan</button>
             <button class="banner-dismiss" id="btn-dismiss-stack-change">Dismiss</button>
           </div>
         </div>
@@ -2116,7 +2185,7 @@ const progressContainer= document.getElementById('progress-container');
 const progressRendered = document.getElementById('progress-rendered');
 const progressIndicator= document.getElementById('progress-indicator');
 const scopeSelect      = document.getElementById('scope-select');
-const optPhased        = document.getElementById('opt-phased');
+
 const btnJiraStories   = document.getElementById('btn-jira-stories');
 const jiraConfigModal  = document.getElementById('jira-config-modal');
 const jiraTeamSizeInput= document.getElementById('jira-team-size');
@@ -2151,16 +2220,25 @@ const chatEmptyState = document.getElementById('chat-empty-state');
 const stackChangeBanner    = document.getElementById('stack-change-banner');
 const stackChangeTitle     = document.getElementById('stack-change-title');
 const stackChangeReason    = document.getElementById('stack-change-reason');
+const bannerScopeNote      = document.getElementById('banner-scope-note');
 const planPatchIndicator   = document.getElementById('plan-patch-indicator');
 const planPatchStatus      = document.getElementById('plan-patch-status');
 const btnApplyStackChange  = document.getElementById('btn-apply-stack-change');
+const btnRegeneratePlan    = document.getElementById('btn-regenerate-plan');
 const btnDismissStackChange = document.getElementById('btn-dismiss-stack-change');
 
 btnApplyStackChange.addEventListener('click', () => {
   stackChangeBanner.style.display = 'none';
   planPatchIndicator.style.display = 'flex';
   planPatchStatus.textContent = 'updating affected sections…';
-  vscode.postMessage({ type: 'applyStackChange' });
+  vscode.postMessage({ type: 'applyStackChange', regenerate: false });
+});
+
+btnRegeneratePlan.addEventListener('click', () => {
+  stackChangeBanner.style.display = 'none';
+  planPatchIndicator.style.display = 'flex';
+  planPatchStatus.textContent = 'regenerating full plan…';
+  vscode.postMessage({ type: 'applyStackChange', regenerate: true });
 });
 
 btnDismissStackChange.addEventListener('click', () => {
@@ -2404,7 +2482,7 @@ function getOptions() {
     includeCiMigration: optCi.checked,
     includeDockerMigration: optDocker.checked,
     detailLevel: detailLevel.value,
-    phasedMode: optPhased.checked,
+    phasedMode: true, // phased schedule is always generated
     scope: scopeSelect.value || 'full',
   };
 }
@@ -2870,6 +2948,18 @@ window.addEventListener('message', (event) => {
       } else {
         stackChangeReason.style.display = 'none';
       }
+      // Show extra guidance and "Regenerate full plan" button for major changes
+      if (intent.scope === 'major') {
+        btnRegeneratePlan.style.display = 'inline-flex';
+        bannerScopeNote.textContent =
+          '⚠️ This is a primary framework change. Regenerating the full plan produces a more coherent result; updating only affected sections is faster but may leave inconsistencies.';
+        bannerScopeNote.style.display = 'block';
+        btnApplyStackChange.textContent = 'Update affected sections';
+      } else {
+        btnRegeneratePlan.style.display = 'none';
+        bannerScopeNote.style.display = 'none';
+        btnApplyStackChange.textContent = 'Update affected sections';
+      }
       stackChangeBanner.style.display = 'flex';
       // Auto-scroll the chat tab so the banner is visible
       stackChangeBanner.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
@@ -2879,9 +2969,9 @@ window.addEventListener('message', (event) => {
     // Plan is being rewritten section-by-section
     case 'planPatchChunk':
       if (msg.chunk === '') {
+        // Empty chunk = patch starting. Keep the old plan visible; it will
+        // be replaced section-by-section so the tab never goes fully blank.
         planMarkdown = '';
-        planRendered.innerHTML = '';
-        planOutput.textContent = '';
       } else {
         planMarkdown += msg.chunk;
         planRendered.innerHTML = parseMarkdown(planMarkdown);

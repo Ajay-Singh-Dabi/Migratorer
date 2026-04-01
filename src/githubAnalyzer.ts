@@ -258,6 +258,77 @@ function findSourceEntryPoints(fileTree: string[], maxFiles = 5): string[] {
     .map((s) => s.path);
 }
 
+// ─── Representative Source File Sampling ─────────────────────────────────────
+
+// Source code extensions worth sending content for
+const SOURCE_EXTENSIONS = new Set([
+  '.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs',
+  '.py', '.java', '.kt', '.go', '.rs', '.rb',
+  '.php', '.cs', '.cpp', '.c', '.h', '.swift',
+  '.vue', '.svelte',
+]);
+
+// Folders whose files don't give useful migration signal — skip them
+const SKIP_SAMPLE_DIRS = new Set([
+  'node_modules', '.git', 'dist', 'build', 'out', 'coverage',
+  '.next', '.nuxt', '__pycache__', '.mypy_cache', 'vendor',
+  'migrations', 'generated', 'gen', 'proto', 'stubs',
+]);
+
+/**
+ * Returns up to `maxFiles` source files sampled across the repo's folder
+ * structure. Picks up to MAX_PER_FOLDER files from each top-level folder,
+ * choosing shortest paths first (most central files), so the AI sees
+ * representative code from every part of the project.
+ */
+function findRepresentativeSourceFiles(
+  fileTree: string[],
+  alreadyIncluded: Set<string>,
+  maxFiles = 25
+): string[] {
+  // Group by top-level folder; root files get '__root__' key
+  const byFolder = new Map<string, string[]>();
+
+  for (const p of fileTree) {
+    const ext = '.' + p.split('.').pop();
+    if (!SOURCE_EXTENSIONS.has(ext)) { continue; }
+    if (alreadyIncluded.has(p)) { continue; }
+
+    const parts = p.split('/');
+    const topFolder = parts.length > 1 ? parts[0] : '__root__';
+
+    if (SKIP_SAMPLE_DIRS.has(topFolder)) { continue; }
+
+    const bucket = byFolder.get(topFolder) ?? [];
+    bucket.push(p);
+    byFolder.set(topFolder, bucket);
+  }
+
+  // Sort each bucket shortest-path-first (most central / shallowest files first)
+  for (const files of byFolder.values()) {
+    files.sort((a, b) => a.length - b.length || a.localeCompare(b));
+  }
+
+  // Visit priority folders first, then the rest alphabetically
+  const PRIORITY_FOLDERS = ['src', 'app', 'lib', 'server', 'api', 'core', 'pkg', '__root__'];
+  const orderedFolders = [
+    ...PRIORITY_FOLDERS.filter((f) => byFolder.has(f)),
+    ...[...byFolder.keys()].filter((f) => !PRIORITY_FOLDERS.includes(f)).sort(),
+  ];
+
+  const chosen: string[] = [];
+  const MAX_PER_FOLDER = 5; // up to 5 files per top-level folder
+
+  for (const folder of orderedFolders) {
+    if (chosen.length >= maxFiles) { break; }
+    const files = byFolder.get(folder)!;
+    const take = Math.min(MAX_PER_FOLDER, files.length, maxFiles - chosen.length);
+    chosen.push(...files.slice(0, take));
+  }
+
+  return chosen;
+}
+
 // ─── Key Files to Detect ─────────────────────────────────────────────────────
 
 const KEY_FILE_PATTERNS: Array<{ path: string; type: KeyFile['type'] }> = [
@@ -525,18 +596,33 @@ export async function analyzeRepository(
     f.startsWith('.github/workflows/') && f.endsWith('.yml') && !isIgnoredByMigrationIgnore(f, ignoreRules)
   ).slice(0, 2);
 
-  // Source entry points (enhancement #1)
-  const sourceEntryPoints = findSourceEntryPoints(fileTree).filter(
-    (p) => !isIgnoredByMigrationIgnore(p, ignoreRules)
-  );
+  // Collect ALL source files up to MAX_SOURCE_FILES — these are what the
+  // chunked LLM analysis will process. We sort by path length (shallowest/most
+  // central files first) so the most important code is fetched within the limit.
+  const MAX_SOURCE_FILES = 80;
+  const configPaths = new Set<string>([
+    ...existingKeyFiles.map((kf) => kf.path),
+    ...ciWorkflows,
+  ]);
+  const allSourceFiles = fileTree
+    .filter((p) => {
+      if (configPaths.has(p)) { return false; }
+      const ext = '.' + p.split('.').pop();
+      if (!SOURCE_EXTENSIONS.has(ext)) { return false; }
+      if (isIgnoredByMigrationIgnore(p, ignoreRules)) { return false; }
+      if (isBlockedFile(p)) { return false; }
+      const topFolder = p.split('/')[0];
+      return !SKIP_SAMPLE_DIRS.has(topFolder);
+    })
+    .sort((a, b) => a.split('/').length - b.split('/').length || a.localeCompare(b))
+    .slice(0, MAX_SOURCE_FILES);
 
-  const allToFetch = [
+  const allToFetch: Array<{ path: string; type: KeyFile['type'] }> = [
     ...existingKeyFiles,
     ...ciWorkflows
       .filter((p) => !existingKeyFiles.some((kf) => kf.path === p))
       .map((p) => ({ path: p, type: 'ci' as KeyFile['type'] })),
-    ...sourceEntryPoints
-      .filter((p) => !existingKeyFiles.some((kf) => kf.path === p))
+    ...allSourceFiles
       .map((p) => ({ path: p, type: 'source' as KeyFile['type'] })),
   ];
 
@@ -558,8 +644,11 @@ export async function analyzeRepository(
         const raw = await fetchFileContent(owner, repo, path, token, hostname);
         if (!raw) { return null; }
 
-        // Truncate before redacting to keep the operation bounded
-        const truncated = raw.length > 8000 ? raw.slice(0, 8000) + '\n... (truncated)' : raw;
+        // Config files can be large (lock files etc.) — truncate generously.
+        // Source files get a smaller cap; the chunked LLM analysis works per file
+        // so having every file read is more important than having each read fully.
+        const limit = type === 'source' ? 4000 : 8000;
+        const truncated = raw.length > limit ? raw.slice(0, limit) + '\n... (truncated)' : raw;
 
         // Redact secrets from the content
         const { redacted, count } = redactSecrets(truncated);

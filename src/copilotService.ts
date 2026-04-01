@@ -96,12 +96,35 @@ function buildContext(analysis: RepoAnalysis, targetStack: string): string {
   const devDepsList = Object.entries(maskedDevDeps).slice(0, 12)
     .map(([k, v]) => `  ${k}: ${v}`).join('\n');
 
-  // Very short file snippets — enough to understand the codebase shape
-  const fileSnippets = keyFiles.slice(0, 4)
+  // Short file snippets — include all fetched files so the AI sees the full sample
+  const fileSnippets = keyFiles.slice(0, 25)
     .map(f => {
-      const safe = f.content.replace(/\[REDACTED:[^\]]*\]/g, '""').slice(0, 300);
+      const safe = f.content.replace(/\[REDACTED:[^\]]*\]/g, '""').slice(0, 400);
       return `${f.path}:\n${safe}`;
     }).join('\n\n---\n\n');
+
+  // Show up to 300 paths from the full file tree, grouped by top-level folder
+  // so the AI understands the complete project structure.
+  const MAX_TREE = 300;
+  const treeToShow = safeFileTree.slice(0, MAX_TREE);
+  const byFolder = new Map<string, string[]>();
+  for (const p of treeToShow) {
+    const slash = p.indexOf('/');
+    const folder = slash >= 0 ? p.slice(0, slash) : '(root)';
+    if (!byFolder.has(folder)) { byFolder.set(folder, []); }
+    byFolder.get(folder)!.push(p);
+  }
+  const fileTreeSection = Array.from(byFolder.entries())
+    .map(([folder, files]) => `${folder}/\n${files.map(f => `  ${f}`).join('\n')}`)
+    .join('\n');
+  const treeTruncNote = safeFileTree.length > MAX_TREE
+    ? `\n... and ${safeFileTree.length - MAX_TREE} more files (total: ${analysis.totalFiles})`
+    : '';
+
+  // Folder-level summary: quick overview of module structure by file count
+  const folderSummary = Array.from(byFolder.entries())
+    .map(([folder, files]) => `  ${folder}/  (${files.length} files)`)
+    .join('\n');
 
   return `Project: ${repoInfo.owner}/${repoInfo.repo}
 Language: ${repoInfo.language} | Files: ${analysis.totalFiles} | Size: ${repoInfo.size} KB
@@ -124,11 +147,24 @@ ${depsList || '  (none)'}
 Dev dependencies:
 ${devDepsList || '  (none)'}
 
+Module structure (top-level folders):
+${folderSummary}
+
 Key files (short excerpt):
 ${fileSnippets || '(none)'}
 
-File tree sample:
-${safeFileTree.slice(0, 30).join('\n')}`;
+Full project file tree (all folders and files):
+${fileTreeSection}${treeTruncNote}
+
+IMPORTANT: Any file path you mention in your output MUST come from the file tree above. Do not invent file names.
+
+${analysis.chunkSummaries?.length
+  ? `─── Full Codebase Analysis (${analysis.keyFiles.filter(f => f.type === 'source').length} source files analyzed in ${analysis.chunkSummaries.length} groups) ───
+
+${analysis.chunkSummaries.map((cs) =>
+  `Group ${cs.chunkIndex + 1} — files: ${cs.files.join(', ')}\n${cs.summary}`
+).join('\n\n---\n\n')}`
+  : '(Run "Generate Plan" to trigger full codebase analysis)'}`;
 }
 
 // ─── Section definitions ───────────────────────────────────────────────────────
@@ -145,42 +181,116 @@ function buildSections(
   options: AnalysisOptions
 ): PlanSection[] {
   const { detectedStack } = analysis;
+  const { safe: safeTree } = filterFileTree(analysis.fileTree);
+
+  // Compact path list injected directly into file-heavy sections so the model
+  // references real files rather than inventing placeholders.
+  const allPaths = safeTree.slice(0, 400).join('\n');
 
   return [
+    // ── Section 1: Architecture Overview ─────────────────────────────────────
     {
-      heading: '## 1. Migration Feasibility Assessment',
-      ask: `Based on the project context, write a Migration Feasibility Assessment covering:
-- Complexity rating (Low / Medium / High / Very High) with a detailed explanation referencing the actual framework, file count, and dependency count
-- Effort estimates as a table: Solo developer | Small team (2–3) | Experienced contractor — each with a week estimate and key assumptions
-- A risk register table with at least 6 risks specific to this migration (columns: Risk | Likelihood | Impact | Mitigation)
-- Prerequisites that must be in place before starting
+      heading: '## 1. Current Architecture Overview',
+      ask: `Using ONLY the file tree and key file excerpts provided above, describe the current project architecture. Do not guess — only describe what is visible in the context.
 
-Be specific to this project. Reference actual package names and versions.`,
+### 1.1 Module Structure
+For each top-level folder in the module structure above, write one line: folder name, what it contains, its role in the application.
+
+### 1.2 Entry Points
+List the main entry point file(s) by exact path from the file tree. Explain what each one does.
+
+### 1.3 Application Layers
+Identify: UI layer, API/route layer, service/business logic layer, data/persistence layer, config layer. For each, list the actual folder and representative file paths from the tree.
+
+### 1.4 Key Files for Migration
+List the 15–20 most important files that will need to change during migration. Use exact paths from the file tree. For each: path, current purpose, expected change type (Rewrite / Config update / Remove / Keep).
+
+### 1.5 External Integration Inventory
+Scan the file tree and key file excerpts for all external integration points this codebase depends on: webhooks, OAuth/SSO callbacks, third-party SDKs, payment processors, email providers, analytics, feature-flag services, secret managers, CDN/object-storage clients, monitoring agents. For each integration found:
+- **Name:** [service name]
+- **Type:** [webhook / OAuth callback / SDK / API client / agent]
+- **Where declared:** [exact file path(s) from the tree]
+- **Migration impact:** [URL/key change required / SDK replacement / No change]
+
+If none are detected, state "No external integrations detected in the visible file tree."`,
     },
+    // ── Section 2: Feasibility ────────────────────────────────────────────────
     {
-      heading: '## 2. Current Stack → Target Stack Mapping',
-      ask: `Write a complete stack mapping table for migrating this project to ${targetStack}.
+      heading: '## 2. Migration Feasibility Assessment',
+      ask: `Based on the architecture overview and file tree, write a Migration Feasibility Assessment:
 
-Use a standard markdown pipe table — every row MUST start and end with |:
+- **Complexity rating** (Low / Medium / High / Very High) — justify with actual file count (${analysis.totalFiles} total), folder count, key dependencies, and detected framework version
 
-| Category | Current | Current Version | Target | Target Version | Change Type |
-|----------|---------|-----------------|--------|----------------|-------------|
-| Runtime  | ...     | ...             | ...    | ...            | ...         |
+- **Test coverage caveat:** Identify whether test files exist in the file tree. Estimate existing test coverage (High ≥70% / Medium 30–70% / Low <30% / Unknown — no test files found). State the migration risk multiplier: low coverage means regressions may go undetected through the migration.
 
-Fill every cell with real values. Cover: Runtime, Framework, Build Tool, Package Manager, State Management, Routing, Styling, Testing, Linting, Formatting, CI/CD, Deployment, Database/ORM.
+- **Effort table:**
+
+| Team Size | Estimate | Key Assumptions |
+|-----------|----------|-----------------|
+| Solo developer | ? weeks | ... |
+| Small team (2–3) | ? weeks | ... |
+| Experienced contractor | ? weeks | ... |
+
+- **Risk register** (minimum 10 risks — include at least one risk per category: data, integration, test coverage, deployment, security, rollback):
+
+| Risk | Likelihood | Impact | Mitigation |
+|------|-----------|--------|------------|
+
+- **Prerequisites** before starting (specific commands, environment checks, and go/no-go criteria)`,
+    },
+    // ── Section 3: Breaking Changes ───────────────────────────────────────────
+    {
+      heading: '## 3. Breaking Changes & Gotchas',
+      ask: `List every breaking change between ${detectedStack.framework} and ${targetStack} that will affect files in this project.
+
+For each breaking change:
+### Breaking Change: [Name]
+- **What breaks:** [which specific file(s) from the file tree are affected — use exact paths]
+- **Why:** [technical root cause]
+- **Fix:** [exact code change with before/after]
+- **Find it:** \`[grep/search command]\`
+
+Write at least 8 breaking changes. Reference real file paths from the tree.`,
+    },
+    // ── Section 4: Stack Mapping ──────────────────────────────────────────────
+    {
+      heading: '## 4. Current Stack → Target Stack Mapping',
+      ask: `Write the complete technology mapping table for migrating to ${targetStack}.
+
+Every row MUST start and end with |:
+
+| Category | Current | Version | → | Target | Version | Change Type |
+|----------|---------|---------|---|--------|---------|-------------|
+
+Fill every cell with real values from the detected stack above. Cover all rows: Runtime, Framework, Build Tool, Package Manager, State Management, Routing, Styling, Testing, Linting, Formatting, CI/CD, Containerisation, Database/ORM, Auth.
 
 Change Types: Direct upgrade / Full replacement / New addition / Remove / Keep as-is
 
-After the table, write a short paragraph explaining the most significant changes and the rationale for each choice.`,
+After the table, explain the 3 most significant changes and the technical rationale.`,
     },
+    // ── Section 5: Step-by-step ───────────────────────────────────────────────
     {
-      heading: '## 3. Step-by-Step Migration Guide',
-      ask: `Write a detailed, numbered step-by-step migration guide from ${analysis.detectedStack.framework} to ${targetStack}.
+      heading: '## 5. Step-by-Step Migration Guide',
+      ask: `Write a detailed numbered migration guide from ${detectedStack.framework} to ${targetStack}.
 
-For each step use this structure:
+First, scan the file tree and categorise all files that need to change:
+
+<file-tree>
+${allPaths}
+</file-tree>
+
+Group them:
+- **Config files to rewrite:** (exact paths)
+- **Source files to update:** (exact paths, grouped by folder)
+- **Test files to migrate:** (exact paths)
+- **Files to delete:** (exact paths)
+- **New files to create:** (path + purpose)
+
+Then write the step-by-step guide. For each step:
+
 ### Step N: [Action title]
-**Why:** [technical reason]
-**Files affected:** [actual file names from this project]
+**Why:** [technical reason — reference a breaking change from Section 3 if relevant]
+**Files:** [exact paths from the file tree above]
 \`\`\`bash
 # exact command
 \`\`\`
@@ -193,36 +303,38 @@ For each step use this structure:
 [new code pattern]
 \`\`\`
 **Verify:** \`[command]\` → [expected output]
+**Rollback:** \`[exact command to undo this step — e.g. git revert, npm install old-package, restore backup, or git checkout -- <file>]\`
 
-Write at least 10 steps covering: project setup, config migration, each major file change, testing, CI/CD, and deployment.`,
+Write at least 12 steps covering: dependencies → config → routes → services → models → tests → CI/CD → build → deploy. Every file path must exist in the file tree above.`,
     },
+    // ── Section 6: Dependencies ───────────────────────────────────────────────
     {
-      heading: '## 4. Dependency Migration',
-      ask: `Write the full dependency migration guide for this project. Use standard markdown pipe tables (every row must start and end with |).
+      heading: '## 6. Dependency Migration',
+      ask: `Write the complete dependency migration guide. Use markdown pipe tables (every row starts and ends with |).
 
-### Dependencies to Remove
+### Remove
 | Package | Current Version | Reason | Replacement |
 |---------|-----------------|--------|-------------|
-(one row per dependency listed above — no "etc.")
+(one row per dependency from the detected stack — no "etc.")
 
-### Dependencies to Add
+### Add
 | Package | Version | Purpose | Install Command |
 |---------|---------|---------|-----------------|
-(every new package needed for ${targetStack})
 
-### Dependencies to Upgrade
-| Package | From | To | Breaking Changes | Migration Notes |
-|---------|------|----|-----------------|-----------------|
+### Upgrade
+| Package | From | To | Breaking Changes | Notes |
+|---------|------|----|-----------------|-------|
 
-End with a paragraph on version lock strategy for the new stack.`,
+End with: single install command to apply all changes, and lockfile strategy for the new stack.`,
     },
+    // ── Section 7: Code Pattern Changes ──────────────────────────────────────
     {
-      heading: '## 5. Code Pattern Changes',
-      ask: `Identify every code pattern that must change when migrating from ${detectedStack.framework} to ${targetStack}.
+      heading: '## 7. Code Pattern Changes',
+      ask: `For each recurring code pattern that must change in this migration:
 
-For each pattern write:
 ### Pattern: [Name]
-**Problem:** [why the old pattern doesn't work]
+**Where it appears:** [list actual file paths from the file tree that contain this pattern]
+**Problem:** [why the old pattern doesn't work in ${targetStack}]
 **Before** (${detectedStack.primaryLanguage}):
 \`\`\`
 [current code]
@@ -231,92 +343,245 @@ For each pattern write:
 \`\`\`
 [new code]
 \`\`\`
-**Files that use this pattern:** [list actual filenames]
+**How to find all occurrences:** \`[grep command]\`
 
-Cover at least 6 patterns: e.g. routing, config loading, data access, auth, error handling, module imports.`,
+Cover at least 8 patterns. Only mention file paths that exist in the file tree.`,
     },
+    // ── Section 8: Data Migration Strategy (NEW) ─────────────────────────────
     {
-      heading: '## 6. Test Migration',
-      ask: `Write the test migration plan for moving from "${detectedStack.testingFrameworks.join(', ') || 'no tests'}" to the testing tools in ${targetStack}.
+      heading: '## 8. Data Migration Strategy',
+      ask: `Write a production-safe data and schema migration strategy for this migration from ${detectedStack.framework} to ${targetStack}.
 
-- Current test inventory and gaps
-- Framework mapping table (old → new, API differences)
-- Before/after example for a unit test and integration test
-- Commands to run the new test suite and measure coverage
-- Coverage targets`,
+### 8.1 Schema Change Inventory
+Scan the file tree for migration files, ORM model definitions, and schema files (look for paths containing: migrations/, models/, schema, prisma, sequelize, alembic, typeorm, flyway, liquibase, db/). List each schema change that the migration will require, with the relevant file paths.
+
+If no schema files are detected, state "No ORM/migration files found — add schema change inventory manually."
+
+### 8.2 Expand / Contract Pattern (Zero-Downtime)
+For each breaking schema change, describe the 3-phase expand/contract approach:
+- **Expand phase:** Add new columns/tables without removing old ones. Both old and new code work.
+- **Migrate phase:** Backfill existing rows. Provide the exact SQL or ORM migration script.
+- **Contract phase:** Remove old columns/tables only after the new stack is fully deployed and verified.
+
+Provide real SQL or migration-framework commands for each phase.
+
+### 8.3 Migration Script Standards
+- Naming convention for migration files (e.g. \`V{timestamp}__{description}.sql\`)
+- How to version and track applied migrations
+- How to run migrations in CI vs production (exact commands)
+- How to verify data integrity after each migration: \`[verification query or script]\`
+
+### 8.4 Rollback Strategy
+For each migration step above, provide the exact rollback script or command (e.g. \`ALTER TABLE ... DROP COLUMN ...\`, ORM \`down()\` method, or snapshot restore). State any irreversible steps (e.g. data-type narrowing, column drops) and what backup must be taken before running them.
+
+### 8.5 Data Integrity Checks
+Provide at least 3 SQL/ORM queries to run after migration to verify data completeness and correctness (e.g. row count comparison, null checks on required fields, foreign key constraint validation).`,
+    },
+    // ── Section 9: Test Migration ─────────────────────────────────────────────
+    {
+      heading: '## 9. Test Migration',
+      ask: `Write the test migration plan.
+
+- Current test files (list paths from the file tree matching test/spec patterns)
+- Estimated current coverage level (based on ratio of test files to source files in the tree)
+- Framework mapping: ${detectedStack.testingFrameworks.join(', ') || 'none detected'} → ${targetStack} testing tools
+- Before/after example for a unit test and an integration test
+- Migration command sequence
+- Coverage target (minimum 70% recommended for a safe migration) and measurement command
+- If coverage is currently low: add a "write missing tests before migration" task to Phase 1 of the schedule`,
       condition: options.includeTestMigration,
     },
+    // ── Section 10: CI/CD ─────────────────────────────────────────────────────
     {
-      heading: '## 7. CI/CD Pipeline Update',
-      ask: `Write the complete updated CI/CD pipeline for ${targetStack} (adapt to ${detectedStack.ciSystem || 'GitHub Actions'}).
+      heading: '## 10. CI/CD Pipeline Update',
+      ask: `Write the updated CI/CD pipeline for ${targetStack} (based on ${detectedStack.ciSystem || 'GitHub Actions'}).
 
-Provide a ready-to-commit YAML file covering: install, lint, type-check, test, build, and deploy stages.
+Provide a complete, ready-to-commit YAML covering: install, lint, type-check, test, build, deploy.
 
 \`\`\`yaml
 # complete pipeline
 \`\`\`
 
-Then list every environment variable needed, what it is, and where to get it.`,
+List every required environment variable, its purpose, and where to store it.
+
+Add a **migration safety gate** job that runs before deploy: it must run all database migrations in a dry-run or against a staging environment and fail the pipeline if any migration errors. Show the YAML job definition.`,
       condition: options.includeCiMigration,
     },
+    // ── Section 11: Docker / Container Updates ────────────────────────────────
     {
-      heading: '## 8. Docker / Container Updates',
-      ask: `Analyse the current Dockerfile layer by layer, then write the complete updated Dockerfile for ${targetStack} with a comment on every changed layer.
+      heading: '## 11. Docker / Container Updates',
+      ask: `Analyse the current Dockerfile and docker-compose files visible in the file tree. Provide the complete updated versions for ${targetStack}:
 
 \`\`\`dockerfile
-# updated Dockerfile
+# updated Dockerfile — comment every changed layer
 \`\`\`
 
-If docker-compose is used, provide the updated version too.`,
+\`\`\`yaml
+# updated docker-compose.yml (if applicable)
+\`\`\``,
       condition: options.includeDockerMigration && detectedStack.containerized,
     },
+    // ── Section 12: Performance & Security Improvements ───────────────────────
     {
-      heading: '## 9. Breaking Changes & Gotchas',
-      ask: `List every breaking change between ${detectedStack.framework} and ${targetStack} that will affect this project.
+      heading: '## 12. Performance & Security Improvements',
+      ask: `For each improvement ${targetStack} brings over ${detectedStack.framework}:
 
-For each breaking change:
-### Breaking Change: [Name]
-- **What breaks:** [specific file or API]
-- **Why:** [technical root cause]
-- **Fix:** [exact code change]
-- **Find it:** \`[grep or search command]\`
-
-Cover at least 6 breaking changes specific to this migration path.`,
-    },
-    {
-      heading: '## 10. Performance & Security Improvements',
-      ask: `For each improvement that ${targetStack} brings over the current ${detectedStack.framework} stack:
-
-### [Improvement name]
-- **Current limitation:** [what is slow or weak now]
-- **How the new stack fixes it:** [specific mechanism]
+### [Improvement title]
+- **Current limitation:** [what is slow or insecure now, with specific version or pattern]
+- **Root cause:** [why the current stack has this]
+- **Fix in ${targetStack}:** [specific mechanism, config, or API]
 - **Expected gain:** [quantified estimate]
-- **How to enable it:** [config or code]
+- **Verify:** [benchmark or security scan command]
 
-Cover at least 4 performance and 4 security improvements.`,
+Write at least 4 performance and 4 security improvements. Reference config files from the file tree where applicable.`,
     },
+    // ── Section 13: Traffic Routing & Cutover Strategy (NEW) ─────────────────
     {
-      heading: '## 11. Post-Migration Checklist',
-      ask: `Write a numbered post-migration checklist. Every item must be specific and include a command to verify it.
+      heading: '## 13. Traffic Routing & Cutover Strategy',
+      ask: `Write a production-safe traffic routing and cutover strategy for the live switch from ${detectedStack.framework} to ${targetStack}. A "big-bang" cutover is NOT acceptable for production systems — describe a gradual, verifiable approach.
 
-1. [ ] [specific item] — verify with: \`command\`
-2. [ ] ...
+### 13.1 Recommended Cutover Pattern
+Choose the most appropriate pattern for this codebase and justify why:
+- **Strangler Fig** — incrementally replace routes/modules behind a router/proxy until old service is fully replaced
+- **Blue/Green Deployment** — run both stacks simultaneously, flip DNS/load-balancer once new stack is verified
+- **Canary Release** — route a % of real traffic to the new stack, monitor, then increase gradually
 
-Include at least 15 items covering: functionality, performance, security, CI/CD, monitoring, and documentation.`,
+Provide the specific infrastructure changes (load balancer config, reverse proxy rules, feature-flag config) needed to implement the chosen pattern.
+
+### 13.2 Traffic Shift Schedule
+Define the incremental steps:
+
+| Stage | Traffic to New Stack | Duration | Success Criteria | Rollback Trigger |
+|-------|--------------------|----------|------------------|-----------------|
+| Canary | 5% | 30 min | Error rate < 0.1%, P95 < baseline + 20% | Any error rate spike |
+| Ramp | 25% | 1 hour | ... | ... |
+| Half | 50% | 1 hour | ... | ... |
+| Full | 100% | — | All checks green | Immediate rollback |
+
+### 13.3 Feature Flag Integration (if applicable)
+If the codebase has a feature-flag service or any conditional branching tied to environment variables (scan the file tree and key files for feature flag patterns), show how to use flags to route at the application level without infrastructure changes.
+
+### 13.4 DNS / Load Balancer Cutover Commands
+Provide exact CLI commands for the cutover (e.g. AWS CLI, kubectl, nginx config reload, DNS TTL change). Include pre-cutover TTL reduction and post-cutover verification.
+
+### 13.5 Rollback Plan
+**Trigger criteria:** List the exact metrics that trigger an immediate rollback (e.g. HTTP 5xx rate > 1%, P95 latency > Xms, X failed health checks).
+**Rollback steps:**
+1. [exact command] — expected time: Xs
+2. [exact command] — expected time: Xs
+...
+**Recovery time objective (RTO):** [estimated time to full rollback]`,
     },
+    // ── Section 14: Observability During Migration (NEW) ─────────────────────
     {
-      heading: '## 12. Phased Migration Schedule',
-      ask: `Break this migration into 3 phases:
+      heading: '## 14. Observability During Migration',
+      ask: `Write an observability and monitoring plan specifically for the migration period — not for steady-state production, but for the window while the new stack is being deployed and traffic is being shifted.
 
-### Phase 1 — Foundation (no breaking changes, ships independently)
-Goal, duration estimate, and task list with commands and affected files.
+### 14.1 Key Metrics to Monitor During Cutover
+For each metric below, provide: what to watch, normal baseline, alert threshold, and what the anomaly indicates:
 
-### Phase 2 — Core Migration (breaking changes, feature branch)
-Goal, duration estimate, and task list.
+| Metric | Baseline | Alert Threshold | What it indicates |
+|--------|---------|-----------------|-------------------|
+| HTTP 5xx error rate | | | |
+| HTTP 4xx error rate | | | |
+| P50 response time | | | |
+| P95 response time | | | |
+| P99 response time | | | |
+| Database connection pool utilisation | | | |
+| Database query error rate | | | |
+| Memory usage (new stack process) | | | |
+| CPU usage (new stack process) | | | |
+| Failed authentication / 401 rate | | | |
+| Queue depth (if async workers present) | | | |
 
-### Phase 3 — Hardening & Cutover
-Goal, duration estimate, and task list.`,
-      condition: options.phasedMode,
+Fill in realistic threshold values based on the detected stack and typical production behaviour.
+
+### 14.2 Structured Logging Requirements
+The new stack MUST emit structured (JSON) logs with at minimum these fields during migration:
+- \`migration_phase\` (phase name from the phased schedule)
+- \`stack_version\` (old | new | both)
+- \`request_id\`
+- \`user_id\` (or session_id)
+- \`duration_ms\`
+- \`error\` (if present)
+
+Show exactly where to add this logging in ${targetStack} (code location from the file tree, with before/after snippet).
+
+### 14.3 Dark Launch / Shadow Mode (if applicable)
+If the codebase handles data writes, describe a shadow-mode setup where the new stack receives real requests in parallel but its writes are discarded, allowing output comparison without affecting production data.
+
+### 14.4 Alerting Rules
+Write at least 5 specific alerting rules (in pseudo-code or as your monitoring tool's query format) that should be active during the cutover window:
+1. Rule name: [name] — Query: [query] — Severity: [critical/warning] — Action: [page on-call / auto-rollback]
+...
+
+### 14.5 Migration Dashboard
+List the 8 most important dashboard panels to have open in your monitoring tool during the cutover, in priority order. For each: panel name, what it shows, why it matters during migration.
+
+### 14.6 Post-Cutover Soak Period
+After reaching 100% traffic on the new stack, define the minimum soak period before considering the migration complete, and the criteria for closing the migration incident/change ticket.`,
+    },
+    // ── Section 15: Post-Migration Checklist ─────────────────────────────────
+    {
+      heading: '## 15. Post-Migration Checklist',
+      ask: `Write the post-migration verification checklist. Every item must include a concrete verification command and an expected outcome.
+
+Format each item as:
+- [ ] **[Item]** — \`[command]\` → [expected output]
+
+Cover at least 25 items across these categories:
+- **Code correctness:** all key source files updated, no old import patterns remain, no dead code referencing old framework
+- **Test quality:** test suite passes, coverage ≥ target, no skipped tests
+- **Build & artefacts:** production build succeeds, bundle size within budget, no debug flags
+- **Dependencies:** no old packages in node_modules / site-packages, lockfile committed, no duplicate package versions
+- **Data integrity:** migration scripts applied, row counts match, no null violations, foreign keys valid
+- **Security:** dependency audit passes, secrets not hardcoded, HTTPS enforced, auth flows tested, OWASP headers present
+- **Performance:** P95 latency at or below baseline, no N+1 queries, cache warm
+- **Infrastructure:** CI pipeline green, Docker image builds and starts, health endpoint returns 200, env vars configured in all environments
+- **Observability:** structured logs flowing, alerts configured, dashboards updated
+- **Documentation:** README updated, API docs reflect new stack, runbook updated, on-call handover done`,
+    },
+    // ── Section 16: Phased Migration Schedule (always generated) ─────────────
+    {
+      heading: '## 16. Phased Migration Schedule',
+      ask: `Break this migration into 3 phases based on the actual file inventory. Every phase must be independently deployable to production — no "big-bang" all-at-once approach.
+
+### Phase 1 — Foundation (ships to production independently, zero breaking changes)
+**Goal:** Set up the new toolchain alongside the old stack. No user-facing changes.
+**Duration:** [estimate]
+**Go/No-Go criteria:** [what must be true before starting Phase 2]
+
+Numbered task list with exact file paths, terminal commands, and verification steps. Include:
+- Dependency installs (exact command)
+- Toolchain config files (exact paths to create/modify)
+- CI pipeline update to run both old and new linters/type-checkers in parallel
+- Baseline test suite run on the new stack (even if tests fail — collect the failure list)
+- Write any missing tests to reach minimum coverage threshold
+
+### Phase 2 — Core Migration (feature branch, breaking changes)
+**Goal:** Migrate all application logic. Traffic still 100% on old stack.
+**Duration:** [estimate]
+**Go/No-Go criteria:** [what must be true before starting Phase 3 — minimum: test suite passes, staging deployment verified]
+
+Numbered task list referencing the breaking changes from Section 3 and steps from Section 5. Include:
+- Order of file migrations (reference exact paths from Section 5 file inventory)
+- Database schema expand phase (reference Section 8)
+- Integration point updates (reference Section 1.5 external integration inventory)
+- End-to-end test run on staging
+
+### Phase 3 — Hardening & Cutover (production traffic shift)
+**Goal:** Migrate production traffic using the cutover strategy from Section 13.
+**Duration:** [estimate]
+**Go/No-Go criteria:** [all Phase 2 criteria met + performance baseline on staging verified + rollback plan rehearsed]
+
+Numbered task list including:
+- Contract phase of database migration (reference Section 8)
+- Deploy new stack to production in parallel (not live yet)
+- Execute traffic shift schedule from Section 13.2 step by step
+- Monitor using Section 14 dashboard during each traffic shift increment
+- Run post-migration checklist from Section 15 at 100% traffic
+- Soak period (reference Section 14.6)
+- Retire old stack (exact commands to decommission: remove containers, revoke old credentials, archive repo branch)`,
     },
   ].filter(s => s.condition !== false);
 }
@@ -435,6 +700,75 @@ async function streamWithFallback(
   await tryStream(model, minimalPrompt, onChunk, cancellationToken);
 }
 
+// ─── Chunked Code Analysis ────────────────────────────────────────────────────
+
+/**
+ * Analyses ALL source files in chunks through Copilot, producing a structured
+ * summary for each chunk. The summaries are then attached to the analysis and
+ * included in every plan section's context so the AI understands the full
+ * codebase — not just a small sample.
+ *
+ * Call this after the user's confirmation popup and before streamMigrationPlan.
+ */
+export async function analyzeFilesInChunks(
+  analysis: RepoAnalysis,
+  onProgress: (msg: string, done: number, total: number) => void,
+  cancellationToken: vscode.CancellationToken
+): Promise<import('./types').ChunkSummary[]> {
+  const sourceFiles = analysis.keyFiles.filter((f) => f.type === 'source');
+  if (sourceFiles.length === 0) { return []; }
+
+  const CHUNK_SIZE = 10;
+  const chunks: typeof sourceFiles[] = [];
+  for (let i = 0; i < sourceFiles.length; i += CHUNK_SIZE) {
+    chunks.push(sourceFiles.slice(i, i + CHUNK_SIZE));
+  }
+
+  const model = await selectModel();
+  const summaries: import('./types').ChunkSummary[] = [];
+
+  for (let i = 0; i < chunks.length; i++) {
+    if (cancellationToken.isCancellationRequested) { break; }
+    onProgress(
+      `Analyzing source files — module group ${i + 1} of ${chunks.length}…`,
+      i,
+      chunks.length
+    );
+
+    const chunk = chunks[i];
+    const fileBlocks = chunk.map((f) => {
+      const content = f.content.replace(/\[REDACTED:[^\]]*\]/g, '""');
+      return `### ${f.path}\n\`\`\`\n${content}\n\`\`\``;
+    }).join('\n\n');
+
+    const prompt =
+      `You are a senior software architect preparing a migration for ${analysis.repoInfo.owner}/${analysis.repoInfo.repo}.\n` +
+      `Current stack: ${analysis.detectedStack.primaryLanguage} / ${analysis.detectedStack.framework}.\n\n` +
+      `Analyze the following ${chunk.length} source files. For each file state:\n` +
+      `- Its responsibility / what it does\n` +
+      `- Key classes, functions, or API endpoints\n` +
+      `- Framework-specific patterns used (routing, ORM, middleware, etc.)\n` +
+      `- Migration-relevant concerns (deprecated APIs, coupling, hard-coded config, etc.)\n\n` +
+      `Then add a short paragraph on how these files relate to each other.\n\n` +
+      fileBlocks;
+
+    const messages = [vscode.LanguageModelChatMessage.User(prompt)];
+    let summary = '';
+    try {
+      const response = await model.sendRequest(messages, {}, cancellationToken);
+      for await (const part of response.text) {
+        summary += part;
+      }
+    } catch {
+      summary = '(analysis unavailable for this chunk)';
+    }
+    summaries.push({ chunkIndex: i, files: chunk.map((f) => f.path), summary });
+  }
+
+  onProgress('Code analysis complete.', chunks.length, chunks.length);
+  return summaries;
+}
+
 // ─── Main Service ─────────────────────────────────────────────────────────────
 
 export async function streamMigrationPlan(
@@ -456,10 +790,22 @@ export async function streamMigrationPlan(
     onChunk(`\n\n${section.heading}\n\n`);
 
     // Each request = shared context + focused single-section ask
-    const prompt = `You are a software architect writing one section of a migration plan.\n\n${context}\n\n---\n\n${section.ask}\n\nBe specific — reference actual file names, package names, and versions from the context above.`;
+    const prompt = `You are a senior software architect producing one section of a professional migration plan. Be precise and actionable. Every file path you mention must exist in the file tree provided. Every package name must come from the dependency list. Do not invent placeholders.
+
+${context}
+
+---
+
+${section.ask}`;
 
     // Fallback: same ask but without file snippets to reduce token usage
-    const metadataPrompt = `You are a software architect writing one section of a migration plan.\n\n${metadataContext}\n\n---\n\n${section.ask}\n\nBe specific — reference actual file names, package names, and versions from the context above.`;
+    const metadataPrompt = `You are a senior software architect producing one section of a professional migration plan. Be precise and actionable. Every package name must come from the dependency list provided.
+
+${metadataContext}
+
+---
+
+${section.ask}`;
 
     const minimalPrompt = `Write the "${section.heading.replace(/^#+\s*/, '')}" section of a migration plan from ${analysis.detectedStack.framework} to ${targetStack}. Be specific and include code examples.`;
 
@@ -590,8 +936,8 @@ Repository: ${repoInfo.owner}/${repoInfo.repo}
 Total files: ${totalFiles}
 Primary language (from GitHub): ${repoInfo.language}
 
-File tree sample:
-${safeFileTree.slice(0, 50).join('\n')}
+File tree sample (${Math.min(safeFileTree.length, 200)} of ${safeFileTree.length} files):
+${safeFileTree.slice(0, 200).join('\n')}
 
 Key file contents:
 ${fileSnippets || '(none)'}
@@ -717,8 +1063,8 @@ export async function streamDebugHelp(
 ## Project Files (sample)
 ${fileContext}
 
-## File Tree (sample)
-${safeFileTree.slice(0, 30).map(f => `- ${f}`).join('\n')}
+## File Tree (${Math.min(safeFileTree.length, 150)} of ${safeFileTree.length} files)
+${safeFileTree.slice(0, 150).map(f => `- ${f}`).join('\n')}
 
 ---
 
@@ -1462,9 +1808,24 @@ export async function streamChatReply(
   const depsLine = Object.entries(maskPrivatePackages(detectedStack.dependencies))
     .slice(0, 20).map(([k, v]) => `${k}@${v}`).join(', ');
 
+  // Smart plan truncation: try to include the whole plan. If too large,
+  // keep the first 8000 chars (covers most plans fully) and note truncation.
+  const MAX_PLAN = 8000;
+  const planContext = plan.length > MAX_PLAN
+    ? plan.slice(0, MAX_PLAN) + `\n\n… (plan truncated at ${MAX_PLAN} chars — ask me about a specific section for full detail)`
+    : plan;
+
+  // Include the codebase chunk summaries so the chat can answer code-level questions
+  const chunkContext = analysis.chunkSummaries?.length
+    ? `\n\n## Codebase Analysis Summary\n` +
+      analysis.chunkSummaries.map((cs) =>
+        `Files: ${cs.files.join(', ')}\n${cs.summary.slice(0, 500)}`
+      ).join('\n---\n')
+    : '';
+
   const systemContext =
 `You are a senior software architect and migration expert.
-Answer questions about the migration plan below. Be concise, technical, and cite specific parts of the plan or codebase when relevant.
+Answer questions about the migration plan and codebase below. Be concise, technical, and cite specific parts of the plan or files when relevant.
 
 ## Repository: ${repoInfo.owner}/${repoInfo.repo}
 - Current stack: ${detectedStack.framework} / ${detectedStack.runtime}
@@ -1472,13 +1833,14 @@ Answer questions about the migration plan below. Be concise, technical, and cite
 - Files: ${analysis.totalFiles} | Size: ${repoInfo.size} KB
 - Key deps: ${depsLine || 'none'}
 - Docker: ${detectedStack.containerized ? 'yes' : 'no'} | CI: ${detectedStack.ciSystem || 'none'}
-- File tree sample: ${safeTree.slice(0, 20).join(', ')}
+- File tree: ${safeTree.slice(0, 60).join(', ')}
+${chunkContext}
 
-## Migration Plan (excerpt — first 3000 chars)
-${plan.slice(0, 3000)}${plan.length > 3000 ? '\n… (truncated)' : ''}
+## Migration Plan
+${planContext}
 
 ---
-Answer the user's question using the context above. If the question refers to a specific step or section, quote it briefly before answering.`;
+Answer the user's question using the context above. If the question refers to a specific step, section, or file, quote it briefly before answering.`;
 
   // Build the message list: system context as first user turn, then history, then new question
   const MAX_HISTORY = 10; // keep last 10 exchanges (20 messages)
@@ -1519,8 +1881,17 @@ export async function detectStackChangeIntent(
 ): Promise<StackChangeIntent | null> {
   const model = await selectModel();
 
-  // Extract all headings from the plan so the model can list affected ones
-  const headings = (currentPlan.match(/^#{1,3} .+/gm) || []).slice(0, 30).join('\n');
+  // Build a compact "section digest" — heading + first 200 chars of content.
+  // This lets the LLM identify WHAT tool is currently used in each section
+  // even when the user's message is vague (e.g. "switch CI/CD to Jenkins"
+  // without naming GitHub Actions).
+  const rawSections = currentPlan.split(/(?=^#{1,3} )/m);
+  const sectionDigest = rawSections.slice(0, 30).map((sec) => {
+    const lines = sec.split('\n');
+    const heading = lines[0].trim();
+    const body = lines.slice(1).join('\n').trim().slice(0, 200);
+    return body ? `${heading}\n  ${body}` : heading;
+  }).join('\n\n');
 
   const prompt =
 `You are a migration-plan assistant. Analyse the user message below and decide whether it is requesting a specific technology/library/tool swap in the migration plan.
@@ -1528,17 +1899,19 @@ export async function detectStackChangeIntent(
 User message:
 """${userMessage}"""
 
-Current plan section headings:
-${headings || '(no plan loaded yet)'}
+Current plan sections (heading + excerpt):
+${sectionDigest || '(no plan loaded yet)'}
 
 Respond with ONLY a valid JSON object (no markdown fences, no extra text) matching one of these two shapes:
 { "intent": false }
-{ "intent": true, "fromComponent": "<old>", "toComponent": "<new>", "reason": "<user reason or empty string>", "affectedSections": ["<heading>", ...] }
+{ "intent": true, "fromComponent": "<old>", "toComponent": "<new>", "reason": "<user reason or empty string>", "affectedSections": ["<exact heading line>", ...], "scope": "minor" }
 
 Rules:
 - Set intent=true ONLY when the user clearly wants to swap/replace a specific technology (library, runtime, database, framework, tool, CI system, etc.).
-- "fromComponent" must be the name currently in the plan or the user's phrasing; "toComponent" is the replacement.
-- "affectedSections" must be the subset of headings above that mention fromComponent (case-insensitive) — empty array if none match.
+- "fromComponent" must be the EXACT name of the tool currently used in the plan (read it from the section excerpts above). Use the user's phrasing only if it matches.
+- "toComponent" is the replacement the user wants.
+- "affectedSections" must list the exact heading lines (verbatim from above) of every section whose content references fromComponent.
+- "scope" must be "major" when the change is a primary web/backend framework swap (e.g. Flask→FastAPI, Django→FastAPI, Express→NestJS, React→Vue, React→Angular), a runtime or language change (Node.js→Go, Python→Java), or the primary database engine (MySQL→PostgreSQL counts as minor — only flag major if the access paradigm changes, e.g. SQL→MongoDB). Set "scope" to "minor" for everything else: CI/CD tool, test framework (Jest→Vitest), ORM/query builder, build tool/bundler, package manager, container orchestrator, linter, logging library, authentication library, state management library.
 - Do NOT set intent=true for general questions, comparisons, or hypothetical discussions.`;
 
   let raw = '';
@@ -1566,6 +1939,7 @@ Rules:
       toComponent:      String(parsed.toComponent      ?? ''),
       reason:           String(parsed.reason           ?? ''),
       affectedSections: Array.isArray(parsed.affectedSections) ? parsed.affectedSections : [],
+      scope:            parsed.scope === 'major' ? 'major' : 'minor',
     };
   } catch {
     return null;
@@ -1636,19 +2010,18 @@ Output ONLY the rewritten section text (starting with the heading line). Do not 
 `Rewrite the following migration plan section, replacing "${intent.fromComponent}" with "${intent.toComponent}". Keep the same structure:\n${section.slice(0, 1000)}`;
 
     let rewritten = '';
-    // Emit the heading immediately so the UI shows progress
-    onChunk(firstLine + '\n');
-
     await streamWithFallback(
       model,
       prompt,
       prompt,
       minimalPrompt,
-      (chunk) => { rewritten += chunk; onChunk(chunk); },
+      (chunk) => { rewritten += chunk; },
       cancellationToken
     );
-
-    patchedSections.push(rewritten || section);
+    // Emit the full rewritten section at once (avoids duplicate heading in UI)
+    const finalSection = rewritten || section;
+    onChunk(finalSection);
+    patchedSections.push(finalSection);
   }
 
   onDone(patchedSections.join(''));

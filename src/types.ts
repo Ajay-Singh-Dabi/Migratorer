@@ -39,6 +39,12 @@ export interface DetectedStack {
   currentVersion: string; // e.g. Node 14, Java 8, Python 3.8
 }
 
+export interface ChunkSummary {
+  chunkIndex: number;
+  files: string[];    // paths of files in this chunk
+  summary: string;    // LLM's structured analysis of those files
+}
+
 export interface RepoAnalysis {
   repoInfo: RepoInfo;
   detectedStack: DetectedStack;
@@ -46,6 +52,7 @@ export interface RepoAnalysis {
   fileTree: string[];
   totalFiles: number;
   redactionSummary: RedactionSummary;
+  chunkSummaries?: ChunkSummary[]; // populated after full code analysis
 }
 
 // ─── Webview <-> Extension Message Types ─────────────────────────────────────
@@ -97,6 +104,7 @@ export interface WebviewMessage {
   reportFormat?: 'word' | 'html'; // for generateReport
   chatMessage?: string;    // for chat
   jiraConfig?: JiraStoriesConfig; // for generateJiraStories
+  regenerate?: boolean;    // for applyStackChange — true = regenerate full plan
 }
 
 export interface AnalysisOptions {
@@ -157,6 +165,13 @@ export interface StackChangeIntent {
   reason: string;
   /** Sections of the plan (heading text) that reference fromComponent */
   affectedSections: string[];
+  /**
+   * 'major' = primary framework / language / runtime change — the whole plan
+   *           should be regenerated for coherence (e.g. Flask→FastAPI, React→Vue)
+   * 'minor' = tool / library / CI / test-framework swap — patch affected
+   *           sections only (e.g. Jest→Vitest, GitHub Actions→Jenkins)
+   */
+  scope: 'major' | 'minor';
 }
 
 export type ExtensionMessageType =
