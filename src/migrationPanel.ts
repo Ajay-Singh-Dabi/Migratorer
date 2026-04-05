@@ -1,8 +1,10 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
-import { analyzeRepository, analyzeOrg, fetchBranchDiff, parseGitHubUrl } from './githubAnalyzer';
+import { analyzeRepository, analyzeOrg, fetchBranchDiff } from './githubAnalyzer';
 import {
   streamMigrationPlan,
+  streamSingleSection,
+  streamCoherenceCheck,
   streamDebugHelp,
   streamExecSummary,
   streamFilePreviews,
@@ -30,7 +32,6 @@ import {
   HistoryEntry,
   ChatMessage,
   StackChangeIntent,
-  JiraStory,
   JiraStoriesConfig,
 } from './types';
 
@@ -46,7 +47,6 @@ export class MigrationPanel {
   private static readonly viewType = 'migrationAssistant';
 
   private readonly _panel: vscode.WebviewPanel;
-  private readonly _extensionUri: vscode.Uri;
   private readonly _secrets: vscode.SecretStorage;
   private readonly _globalState: vscode.Memento;
   private _disposables: vscode.Disposable[] = [];
@@ -81,15 +81,14 @@ export class MigrationPanel {
       }
     );
 
-    MigrationPanel.currentPanel = new MigrationPanel(panel, context.extensionUri, context.secrets, context.globalState);
+    MigrationPanel.currentPanel = new MigrationPanel(panel, context.secrets, context.globalState);
     return MigrationPanel.currentPanel;
   }
 
   // ─── Constructor ──────────────────────────────────────────────────────────────
 
-  private constructor(panel: vscode.WebviewPanel, extensionUri: vscode.Uri, secrets: vscode.SecretStorage, globalState: vscode.Memento) {
+  private constructor(panel: vscode.WebviewPanel, secrets: vscode.SecretStorage, globalState: vscode.Memento) {
     this._panel = panel;
-    this._extensionUri = extensionUri;
     this._secrets = secrets;
     this._globalState = globalState;
 
@@ -214,6 +213,13 @@ export class MigrationPanel {
 
       case 'generateJiraStories':
         await this._generateJiraStories(msg.targetStack!, msg.jiraConfig!);
+        break;
+
+      // Retry a single section that failed during plan generation
+      case 'retrySection':
+        if (msg.sectionHeading) {
+          await this._retrySection(msg.sectionHeading);
+        }
         break;
 
       case 'recommendStacks':
@@ -382,7 +388,7 @@ export class MigrationPanel {
     this._post({ type: 'planChunk', chunk: '' }); // clear signal
 
     try {
-      await streamMigrationPlan(
+      const failedSections = await streamMigrationPlan(
         analysis,
         targetStack,
         options,
@@ -390,10 +396,41 @@ export class MigrationPanel {
           this._lastPlan += chunk;
           this._post({ type: 'planChunk', chunk });
         },
-        token
+        token,
+        (index, total, heading) => {
+          this._post({
+            type: 'sectionProgress',
+            sectionIndex: index,
+            sectionTotal: total,
+            sectionHeading: heading,
+          });
+        }
       );
-      this._post({ type: 'planComplete' });
-      // Persist for progress check / exec summary
+
+      // ── Coherence check: validate the completed plan for contradictions,
+      //    invented file paths, and version mismatches. Wrapped in try/catch
+      //    so a failure here never breaks the plan display.
+      if (!token.isCancellationRequested) {
+        try {
+          const coherenceHeading = '\n\n---\n\n## Plan Coherence Review\n\n';
+          this._lastPlan += coherenceHeading;
+          this._post({ type: 'planChunk', chunk: coherenceHeading });
+          await streamCoherenceCheck(
+            analysis,
+            targetStack,
+            this._lastPlan,
+            (chunk) => {
+              this._lastPlan += chunk;
+              this._post({ type: 'planChunk', chunk });
+            },
+            token
+          );
+        } catch {
+          // Coherence check is best-effort — silently skip on failure
+        }
+      }
+
+      this._post({ type: 'planComplete', failedSections });
       const cfg = vscode.workspace.getConfiguration('migrationAssistant');
       await cfg.update('lastTargetStack', targetStack, vscode.ConfigurationTarget.Global);
       // Save to history (enhancement #9)
@@ -903,7 +940,7 @@ export class MigrationPanel {
       this._post({ type: 'planChunk', chunk: '' }); // clear signal
 
       try {
-        await streamMigrationPlan(
+        const regenFailed = await streamMigrationPlan(
           this._lastAnalysis,   // already has chunkSummaries from the first run
           updatedTarget,
           options,
@@ -911,9 +948,12 @@ export class MigrationPanel {
             this._lastPlan += chunk;
             this._post({ type: 'planChunk', chunk });
           },
-          token
+          token,
+          (index, total, heading) => {
+            this._post({ type: 'sectionProgress', sectionIndex: index, sectionTotal: total, sectionHeading: heading });
+          }
         );
-        this._post({ type: 'planComplete' });
+        this._post({ type: 'planComplete', failedSections: regenFailed });
         const cfg = vscode.workspace.getConfiguration('migrationAssistant');
         await cfg.update('lastTargetStack', updatedTarget, vscode.ConfigurationTarget.Global);
         await this._saveToHistory(this._lastAnalysis, updatedTarget, this._lastPlan);
@@ -946,6 +986,68 @@ export class MigrationPanel {
       );
     } catch (err: any) {
       this._post({ type: 'error', message: err.message || String(err) });
+    }
+  }
+
+  // ─── Retry a single failed section ───────────────────────────────────────────
+
+  private async _retrySection(sectionHeading: string): Promise<void> {
+    if (!this._lastAnalysis || !this._lastTargetStack) {
+      this._post({ type: 'error', message: 'No active plan to retry sections for.' });
+      return;
+    }
+
+    const analysis    = this._lastAnalysis;
+    const targetStack = this._lastTargetStack;
+    const options     = this._lastOptions ?? {
+      includeTestMigration:  true,
+      includeCiMigration:    true,
+      includeDockerMigration: true,
+      detailLevel:           'detailed' as const,
+      phasedMode:            false,
+      scope:                 'full'    as const,
+    };
+
+    this._cancellationSource?.cancel();
+    this._cancellationSource = new vscode.CancellationTokenSource();
+    const token = this._cancellationSource.token;
+
+    // Stream the retried section content via the patch channel so the webview
+    // can replace the existing failed block without clearing the full plan.
+    this._post({ type: 'planPatchChunk', chunk: '' }); // empty chunk = patch starting
+
+    let retryContent = '';
+    try {
+      const ok = await streamSingleSection(
+        analysis, targetStack, options, sectionHeading,
+        (chunk) => {
+          retryContent += chunk;
+          this._post({ type: 'planPatchChunk', chunk });
+        },
+        token
+      );
+
+      if (ok) {
+        // Locate the failed section in the stored plan and replace from its heading
+        // through the failure-notice line with the fresh content.
+        const failureMarker = '> **⚠️ This section could not be generated.**';
+        // Match heading line(s) + anything up to and including the warning blockquote
+        const escaped = sectionHeading.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const pattern = new RegExp(
+          `(##+ \\d+\\.?[^\\n]*${escaped}[^\\n]*)([\\s\\S]*?)` +
+          `${failureMarker.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[^\\n]*\\n?`,
+          'i'
+        );
+        const patchedPlan = this._lastPlan.replace(pattern, `$1\n\n${retryContent}\n`);
+        this._lastPlan = patchedPlan !== this._lastPlan
+          ? patchedPlan
+          : this._lastPlan + `\n\n${retryContent}\n`; // fallback: append
+        this._post({ type: 'planPatchComplete', patchedPlan: this._lastPlan });
+      } else {
+        this._post({ type: 'error', message: `Could not regenerate section "${sectionHeading}". Try again later.` });
+      }
+    } catch (err: any) {
+      this._post({ type: 'error', message: `Retry failed: ${err.message || String(err)}` });
     }
   }
 
@@ -1515,6 +1617,62 @@ export class MigrationPanel {
   #plan-rendered strong { font-weight: 600; }
   #plan-rendered em { font-style: italic; }
   #plan-rendered hr { border: none; border-top: 1px solid var(--vscode-panel-border); margin: 16px 0; }
+
+  /* ── Code blocks (parseMarkdown output) ── */
+  .code-wrap {
+    position: relative;
+    margin: 10px 0;
+    border-radius: var(--radius);
+    border: 1px solid var(--vscode-panel-border);
+    overflow: hidden;
+  }
+  .code-label {
+    display: flex;
+    align-items: center;
+    padding: 5px 12px;
+    font-family: var(--vscode-font-family, sans-serif);
+    font-size: 11px;
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: .05em;
+    color: var(--vscode-descriptionForeground);
+    background: var(--vscode-editor-inactiveSelectionBackground);
+    border-bottom: 1px solid var(--vscode-panel-border);
+    user-select: none;
+  }
+  .code-copy-btn {
+    margin-left: auto;
+    padding: 2px 9px;
+    font-size: 10px;
+    cursor: pointer;
+    border: 1px solid var(--vscode-panel-border);
+    border-radius: 3px;
+    background: transparent;
+    color: var(--vscode-descriptionForeground);
+    font-family: var(--vscode-font-family, sans-serif);
+  }
+  .code-copy-btn:hover { background: var(--vscode-button-secondaryHoverBackground); color: var(--vscode-button-foreground); }
+  .code-wrap pre {
+    margin: 0 !important;
+    padding: 12px 14px !important;
+    border: none !important;
+    border-radius: 0 !important;
+    background: var(--vscode-textCodeBlock-background) !important;
+    overflow-x: auto;
+  }
+  .code-wrap pre code {
+    background: none !important;
+    padding: 0 !important;
+    font-size: 12px;
+    line-height: 1.65;
+    font-family: var(--vscode-editor-font-family, monospace);
+  }
+  /* Syntax token colors (VS Code dark theme defaults) */
+  .tok-kw  { color: #569cd6; font-weight: 600; }
+  .tok-str { color: #ce9178; }
+  .tok-num { color: #b5cea8; }
+  .tok-cmt { color: #6a9955; font-style: italic; }
+  .tok-dec { color: #dcdcaa; }
 
   /* ── Chat ── */
   #tab-chat {
@@ -2312,6 +2470,31 @@ let analysisData = null;
 let isGenerating = false;
 let lastRepoUrl   = '';
 
+// ─── Render Scheduler ─────────────────────────────────────────────────────────
+// Trailing-throttle: each call cancels the previous timer and schedules a new
+// one. Only the render after the LAST chunk in each burst actually fires.
+// Uses setTimeout (not requestAnimationFrame) so renders fire reliably even
+// when the VS Code panel is not the active view — rAF is throttled to ~1 fps
+// by Electron/Chromium for background webviews.
+const RENDER_INTERVAL_MS = 40;
+const _renderTimers = Object.create(null);
+
+function scheduleRender(key, fn) {
+  if (_renderTimers[key]) { clearTimeout(_renderTimers[key]); }
+  _renderTimers[key] = setTimeout(() => {
+    delete _renderTimers[key];
+    fn();
+  }, RENDER_INTERVAL_MS);
+}
+
+function flushRender(key, fn) {
+  if (_renderTimers[key]) {
+    clearTimeout(_renderTimers[key]);
+    delete _renderTimers[key];
+  }
+  fn();
+}
+
 // ─── Element Refs ──────────────────────────────────────────────────────────────
 const btnAnalyze       = document.getElementById('btn-analyze');
 const btnGenerate      = document.getElementById('btn-generate');
@@ -2943,27 +3126,80 @@ window.addEventListener('message', (event) => {
 
     case 'planChunk':
       if (msg.chunk === '') {
+        flushRender('plan', () => {});
         planMarkdown = '';
         planRendered.innerHTML = '';
         planOutput.textContent = '';
         showPlanContainer();
       } else {
         planMarkdown += msg.chunk;
-        planRendered.innerHTML = parseMarkdown(planMarkdown);
-        planOutput.textContent = planMarkdown;
         rawEmpty.style.display = 'none';
         planOutput.style.display = 'block';
-        planRendered.scrollTop = planRendered.scrollHeight;
+        scheduleRender('plan', () => {
+          planRendered.innerHTML = parseMarkdown(planMarkdown);
+          planOutput.textContent = planMarkdown;
+          planRendered.scrollTop = planRendered.scrollHeight;
+        });
       }
       break;
 
     case 'planComplete':
+      flushRender('plan', () => {
+        planRendered.innerHTML = parseMarkdown(planMarkdown);
+        planOutput.textContent = planMarkdown;
+      });
       stopGeneration(false);
       btnSaveMd.disabled = false;
       btnPreviews.disabled = false;
       btnJiraStories.disabled = false;
       enableChat();
+      // Show a retry banner if any sections failed to generate
+      if (msg.failedSections && msg.failedSections.length > 0) {
+        const existingBanner = document.getElementById('section-retry-banner');
+        if (existingBanner) { existingBanner.remove(); }
+        const banner = document.createElement('div');
+        banner.id = 'section-retry-banner';
+        banner.style.cssText = [
+          'display:flex', 'flex-wrap:wrap', 'gap:8px', 'align-items:center',
+          'padding:10px 14px', 'margin-bottom:12px', 'border-radius:6px',
+          'background:var(--vscode-inputValidation-warningBackground,#5a4a00)',
+          'border:1px solid var(--vscode-inputValidation-warningBorder,#b89500)',
+          'font-size:13px',
+        ].join(';');
+        const label = document.createElement('span');
+        label.textContent = \`⚠️ \${msg.failedSections.length} section\${msg.failedSections.length === 1 ? '' : 's'} could not be generated:\`;
+        banner.appendChild(label);
+        msg.failedSections.forEach((heading) => {
+          const btn = document.createElement('button');
+          btn.textContent = \`↻ \${heading}\`;
+          btn.style.cssText = 'padding:3px 10px;cursor:pointer;border-radius:4px;';
+          btn.addEventListener('click', () => {
+            btn.disabled = true;
+            btn.textContent = \`⏳ \${heading}\`;
+            vscode.postMessage({ type: 'retrySection', sectionHeading: heading });
+          });
+          banner.appendChild(btn);
+        });
+        const dismiss = document.createElement('button');
+        dismiss.textContent = '✕';
+        dismiss.title = 'Dismiss';
+        dismiss.style.cssText = 'margin-left:auto;padding:2px 8px;cursor:pointer;opacity:0.7;border-radius:4px;';
+        dismiss.addEventListener('click', () => banner.remove());
+        banner.appendChild(dismiss);
+        planRendered.insertBefore(banner, planRendered.firstChild);
+      }
       break;
+
+    case 'sectionProgress': {
+      // Update the progress bar to reflect which section is being generated
+      const idx   = (msg.sectionIndex ?? 0) + 1;
+      const total = msg.sectionTotal ?? 1;
+      const pct   = Math.round((idx / total) * 90); // cap at 90% — planComplete fills the rest
+      progressBar.style.width = pct + '%';
+      const shortHeading = (msg.sectionHeading ?? '').replace(/^##+ ?\d+\.?\s*/, '');
+      progressText.textContent = \`Generating section \${idx} of \${total}: \${shortHeading}\`;
+      break;
+    }
 
     case 'planSaved':
       btnSaveMd.title = 'Saved!';
@@ -3006,23 +3242,34 @@ window.addEventListener('message', (event) => {
 
     // File previews (enhancement #1)
     case 'previewChunk':
-      if (msg.chunk === '') { previewsMarkdown = ''; previewsRendered.innerHTML = ''; }
+      if (msg.chunk === '') { flushRender('previews', () => {}); previewsMarkdown = ''; previewsRendered.innerHTML = ''; }
       else {
         previewsMarkdown += msg.chunk;
-        previewsRendered.innerHTML = parseMarkdown(previewsMarkdown);
-        previewsRendered.scrollTop = previewsRendered.scrollHeight;
+        scheduleRender('previews', () => {
+          previewsRendered.innerHTML = parseMarkdown(previewsMarkdown);
+          previewsRendered.scrollTop = previewsRendered.scrollHeight;
+        });
       }
       break;
     case 'previewComplete':
+      flushRender('previews', () => {
+        previewsRendered.innerHTML = parseMarkdown(previewsMarkdown);
+      });
       previewsIndicator.style.display = 'none';
       break;
 
     // Debug (enhancement #3)
     case 'debugChunk':
-      if (msg.chunk === '') { debugRendered.innerHTML = ''; }
-      else { debugRendered.innerHTML = parseMarkdown(debugRendered.dataset.md = (debugRendered.dataset.md || '') + msg.chunk); }
+      if (msg.chunk === '') { flushRender('debug', () => {}); debugRendered.innerHTML = ''; debugRendered.dataset.md = ''; }
+      else {
+        debugRendered.dataset.md = (debugRendered.dataset.md || '') + msg.chunk;
+        scheduleRender('debug', () => { debugRendered.innerHTML = parseMarkdown(debugRendered.dataset.md); });
+      }
       break;
     case 'debugComplete':
+      flushRender('debug', () => {
+        debugRendered.innerHTML = parseMarkdown(debugRendered.dataset.md || '');
+      });
       btnDebug.disabled = false;
       btnStopDebug.style.display = 'none';
       break;
@@ -3049,13 +3296,16 @@ window.addEventListener('message', (event) => {
 
     // Progress check (enhancement #8)
     case 'progressChunk':
-      if (msg.chunk === '') { progressRendered.innerHTML = ''; progressRendered.dataset.md = ''; }
+      if (msg.chunk === '') { flushRender('progress', () => {}); progressRendered.innerHTML = ''; progressRendered.dataset.md = ''; }
       else {
         progressRendered.dataset.md = (progressRendered.dataset.md || '') + msg.chunk;
-        progressRendered.innerHTML = parseMarkdown(progressRendered.dataset.md);
+        scheduleRender('progress', () => { progressRendered.innerHTML = parseMarkdown(progressRendered.dataset.md); });
       }
       break;
     case 'progressComplete':
+      flushRender('progress', () => {
+        progressRendered.innerHTML = parseMarkdown(progressRendered.dataset.md || '');
+      });
       progressIndicator.style.display = 'none';
       break;
 
@@ -3107,11 +3357,16 @@ window.addEventListener('message', (event) => {
     case 'jiraStoriesChunk':
       if (msg.chunk) {
         jiraMarkdown += msg.chunk;
-        jiraOutput.innerHTML = parseMarkdown(jiraMarkdown);
-        jiraOutput.scrollTop = jiraOutput.scrollHeight;
+        scheduleRender('jira', () => {
+          jiraOutput.innerHTML = parseMarkdown(jiraMarkdown);
+          jiraOutput.scrollTop = jiraOutput.scrollHeight;
+        });
       }
       break;
     case 'jiraStoriesComplete':
+      flushRender('jira', () => {
+        jiraOutput.innerHTML = parseMarkdown(jiraMarkdown);
+      });
       btnJiraStories.disabled = false;
       btnCsvJira.disabled = false;
       break;
@@ -3123,23 +3378,27 @@ window.addEventListener('message', (event) => {
     case 'chatChunk':
       if (msg.chunk === '') {
         // New assistant turn starting — pending bubble already added by startChatReply()
+        flushRender('chat', () => {});
         chatReplyBuf = '';
       } else {
         chatReplyBuf += msg.chunk;
-        const bubble = document.getElementById('chat-pending-bubble');
-        if (bubble) {
-          bubble.innerHTML = parseMarkdown(chatReplyBuf) + \`<span class="cursor"></span>\`;
-          chatThread.scrollTop = chatThread.scrollHeight;
-        }
+        scheduleRender('chat', () => {
+          const bubble = document.getElementById('chat-pending-bubble');
+          if (bubble) {
+            bubble.innerHTML = parseMarkdown(chatReplyBuf) + \`<span class="cursor"></span>\`;
+            chatThread.scrollTop = chatThread.scrollHeight;
+          }
+        });
       }
       break;
 
     case 'chatComplete': {
+      flushRender('chat', () => {
+        const pendingBubble = document.getElementById('chat-pending-bubble');
+        if (pendingBubble) { pendingBubble.innerHTML = parseMarkdown(chatReplyBuf); }
+      });
       const bubble = document.getElementById('chat-pending-bubble');
-      if (bubble) {
-        bubble.removeAttribute('id');
-        bubble.innerHTML = parseMarkdown(chatReplyBuf);
-      }
+      if (bubble) { bubble.removeAttribute('id'); }
       const wrap = document.getElementById('chat-pending-wrap');
       if (wrap) { wrap.removeAttribute('id'); }
       stopChatReply();
@@ -3186,20 +3445,27 @@ window.addEventListener('message', (event) => {
       if (msg.chunk === '') {
         // Empty chunk = patch starting. Keep the old plan visible; it will
         // be replaced section-by-section so the tab never goes fully blank.
+        flushRender('plan', () => {});
         planMarkdown = '';
       } else {
         planMarkdown += msg.chunk;
-        planRendered.innerHTML = parseMarkdown(planMarkdown);
-        planOutput.textContent = planMarkdown;
-        planRendered.scrollTop = planRendered.scrollHeight;
+        scheduleRender('plan', () => {
+          planRendered.innerHTML = parseMarkdown(planMarkdown);
+          planOutput.textContent = planMarkdown;
+          planRendered.scrollTop = planRendered.scrollHeight;
+        });
       }
       break;
 
     // Plan patch complete — update status and switch to plan tab
     case 'planPatchComplete': {
+      flushRender('plan', () => {});
       planPatchIndicator.style.display = 'none';
       if (msg.patchedPlan) {
         planMarkdown = msg.patchedPlan;
+        planRendered.innerHTML = parseMarkdown(planMarkdown);
+        planOutput.textContent = planMarkdown;
+      } else {
         planRendered.innerHTML = parseMarkdown(planMarkdown);
         planOutput.textContent = planMarkdown;
       }
@@ -3559,6 +3825,91 @@ function escapeHtml(s) {
   return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 
+// ─── Syntax Highlighter ────────────────────────────────────────────────────────
+function highlight(code, lang) {
+  function he(s) { return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+  var KW = {
+    python:     'False None True and as assert async await break class continue def del elif else except finally for from global if import in is lambda nonlocal not or pass raise return try while with yield',
+    javascript: 'async await break case catch class const continue default delete do else export extends finally for from function if import in instanceof let new of return static super switch throw try typeof var void while yield true false null undefined this',
+    typescript: 'abstract any as async await break case catch class const continue declare default delete do else enum export extends finally for from function if implements import in instanceof interface is keyof let namespace never new null of override private protected public readonly return satisfies static super switch this throw try type typeof undefined var void while yield true false',
+    java:       'abstract assert boolean break byte case catch char class continue default do double else enum extends final finally float for if implements import instanceof int interface long native new null package private protected public return short static super switch synchronized this throw throws transient try var void volatile while true false',
+    csharp:     'abstract as base bool break byte case catch char checked class const continue decimal default delegate do double else enum event explicit extern false finally fixed float for foreach goto if implicit in int interface internal is lock long namespace new null object operator out override params private protected public readonly ref return sbyte sealed short sizeof static string struct switch this throw true try typeof uint ulong unchecked unsafe ushort using virtual void volatile while',
+    go:         'break case chan const continue default defer else fallthrough for func go goto if import interface map package range return select struct switch type var true false nil iota',
+    ruby:       'alias and begin break case class def do else elsif end ensure false for if in module next nil not or redo rescue retry return self super then true undef unless until when while yield',
+    php:        'abstract and array as break case catch class clone const continue declare default do echo else elseif enum extends final finally fn for foreach function global if implements instanceof interface match namespace new or private protected public readonly require return static switch throw trait try use var while yield true false null',
+    sql:        'select from where join inner left right outer on as and or not in is null like between order by group having insert into values update set delete create table drop alter add column primary key foreign references index unique default view case when then else end distinct limit offset union all exists true false',
+    bash:       'if then else elif fi for while do done case esac function return break continue exit export local readonly source unset in declare let eval',
+  };
+  var ALIAS = {js:'javascript',ts:'typescript',cs:'csharp',sh:'bash',shell:'bash',py:'python',rb:'ruby'};
+  var ln = (ALIAS[lang] || lang || '').toLowerCase();
+  var kws = {}; (KW[ln] || '').split(' ').forEach(function(k) { if (k) kws[k] = 1; });
+  var lc = ({python:'#',ruby:'#',bash:'#',sql:'--',javascript:'//',typescript:'//',java:'//',csharp:'//',go:'//',php:'//'})[ln] || '//';
+  var hasBC = ['javascript','typescript','java','csharp','go','php'].indexOf(ln) >= 0;
+  var r = '', i = 0, n = code.length, j, w;
+  while (i < n) {
+    var ch = code[i];
+    // Block comment /* ... */
+    if (hasBC && ch === '/' && code[i+1] === '*') {
+      j = code.indexOf('*/', i+2); j = j < 0 ? n : j+2;
+      r += '<span class="tok-cmt">' + he(code.slice(i,j)) + '</span>'; i = j; continue;
+    }
+    // Line comment
+    if (code.substr(i, lc.length) === lc) {
+      j = i; while (j < n && code.charCodeAt(j) !== 10) j++;
+      r += '<span class="tok-cmt">' + he(code.slice(i,j)) + '</span>'; i = j; continue;
+    }
+    // Triple-quoted string (Python/JS)
+    if ((ch === '"' || ch === "'") && code[i+1] === ch && code[i+2] === ch) {
+      j = i+3;
+      while (j < n) { if (code.charCodeAt(j) === 92) { j+=2; continue; } if (code[j]===ch && code[j+1]===ch && code[j+2]===ch) { j+=3; break; } j++; }
+      r += '<span class="tok-str">' + he(code.slice(i,j)) + '</span>'; i = j; continue;
+    }
+    // Single / double quoted string
+    if (ch === '"' || ch === "'") {
+      j = i+1;
+      while (j < n) { if (code.charCodeAt(j) === 92) { j+=2; continue; } if (code[j] === ch || code.charCodeAt(j) === 10) { j++; break; } j++; }
+      r += '<span class="tok-str">' + he(code.slice(i,j)) + '</span>'; i = j; continue;
+    }
+    // Template literal (backtick = char code 96)
+    if (code.charCodeAt(i) === 96) {
+      j = i+1;
+      while (j < n) { if (code.charCodeAt(j) === 92) { j+=2; continue; } if (code.charCodeAt(j) === 96) { j++; break; } j++; }
+      r += '<span class="tok-str">' + he(code.slice(i,j)) + '</span>'; i = j; continue;
+    }
+    // Number
+    if (ch >= '0' && ch <= '9' && (i === 0 || !/[\w$]/.test(code[i-1]))) {
+      j = i; while (j < n && /[\w.]/.test(code[j])) j++;
+      r += '<span class="tok-num">' + he(code.slice(i,j)) + '</span>'; i = j; continue;
+    }
+    // Decorator @name
+    if (ch === '@') {
+      j = i+1; while (j < n && /\w/.test(code[j])) j++;
+      r += '<span class="tok-dec">' + he(code.slice(i,j)) + '</span>'; i = j; continue;
+    }
+    // Identifier / keyword
+    if (/[a-zA-Z_$]/.test(ch)) {
+      j = i; while (j < n && /[\w$]/.test(code[j])) j++;
+      w = code.slice(i,j);
+      r += kws[w] ? '<span class="tok-kw">' + he(w) + '</span>' : he(w); i = j; continue;
+    }
+    r += he(ch); i++;
+  }
+  return r;
+}
+
+function copyCode(btn) {
+  var pre = btn.parentElement && btn.parentElement.nextElementSibling;
+  if (!pre) { return; }
+  var text = pre.textContent || '';
+  if (navigator.clipboard) {
+    navigator.clipboard.writeText(text).then(function() {
+      btn.textContent = '\u2713 Copied';
+      var b = btn;
+      setTimeout(function() { b.textContent = 'Copy'; }, 1500);
+    });
+  }
+}
+
 // ─── Line-by-line Markdown Parser ────────────────────────────────────────────
 function parseMarkdown(md) {
   var lines = md.split('\\n');
@@ -3604,8 +3955,8 @@ function parseMarkdown(md) {
       i++; // closing fence
       out.push(
         '<div class="code-wrap">' +
-        '<div class="code-label">' + esc(lang) + '</div>' +
-        '<pre><code>' + esc(codeAcc.join('\\n')) + '</code></pre>' +
+        '<div class="code-label">' + esc(lang) + '<button class="code-copy-btn" onclick="copyCode(this)">Copy</button></div>' +
+        '<pre><code>' + highlight(codeAcc.join('\\n'), lang) + '</code></pre>' +
         '</div>'
       );
       continue;

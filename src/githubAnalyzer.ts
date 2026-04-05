@@ -5,6 +5,7 @@ import {
   DetectedStack,
   RepoAnalysis,
   RedactionSummary,
+  EnvVarUsage,
 } from './types';
 
 // ─── Secret Redaction ─────────────────────────────────────────────────────────
@@ -272,7 +273,9 @@ const SOURCE_EXTENSIONS = new Set([
 const SKIP_SAMPLE_DIRS = new Set([
   'node_modules', '.git', 'dist', 'build', 'out', 'coverage',
   '.next', '.nuxt', '__pycache__', '.mypy_cache', 'vendor',
-  'migrations', 'generated', 'gen', 'proto', 'stubs',
+  // NOTE: 'migrations' is intentionally NOT skipped — Section 8 (Data Migration Strategy)
+  // needs the actual content of migration files to generate accurate schema migration plans.
+  'generated', 'gen', 'proto', 'stubs',
 ]);
 
 /**
@@ -281,54 +284,6 @@ const SKIP_SAMPLE_DIRS = new Set([
  * choosing shortest paths first (most central files), so the AI sees
  * representative code from every part of the project.
  */
-function findRepresentativeSourceFiles(
-  fileTree: string[],
-  alreadyIncluded: Set<string>,
-  maxFiles = 25
-): string[] {
-  // Group by top-level folder; root files get '__root__' key
-  const byFolder = new Map<string, string[]>();
-
-  for (const p of fileTree) {
-    const ext = '.' + p.split('.').pop();
-    if (!SOURCE_EXTENSIONS.has(ext)) { continue; }
-    if (alreadyIncluded.has(p)) { continue; }
-
-    const parts = p.split('/');
-    const topFolder = parts.length > 1 ? parts[0] : '__root__';
-
-    if (SKIP_SAMPLE_DIRS.has(topFolder)) { continue; }
-
-    const bucket = byFolder.get(topFolder) ?? [];
-    bucket.push(p);
-    byFolder.set(topFolder, bucket);
-  }
-
-  // Sort each bucket shortest-path-first (most central / shallowest files first)
-  for (const files of byFolder.values()) {
-    files.sort((a, b) => a.length - b.length || a.localeCompare(b));
-  }
-
-  // Visit priority folders first, then the rest alphabetically
-  const PRIORITY_FOLDERS = ['src', 'app', 'lib', 'server', 'api', 'core', 'pkg', '__root__'];
-  const orderedFolders = [
-    ...PRIORITY_FOLDERS.filter((f) => byFolder.has(f)),
-    ...[...byFolder.keys()].filter((f) => !PRIORITY_FOLDERS.includes(f)).sort(),
-  ];
-
-  const chosen: string[] = [];
-  const MAX_PER_FOLDER = 5; // up to 5 files per top-level folder
-
-  for (const folder of orderedFolders) {
-    if (chosen.length >= maxFiles) { break; }
-    const files = byFolder.get(folder)!;
-    const take = Math.min(MAX_PER_FOLDER, files.length, maxFiles - chosen.length);
-    chosen.push(...files.slice(0, take));
-  }
-
-  return chosen;
-}
-
 // ─── Key Files to Detect ─────────────────────────────────────────────────────
 
 const KEY_FILE_PATTERNS: Array<{ path: string; type: KeyFile['type'] }> = [
@@ -336,29 +291,40 @@ const KEY_FILE_PATTERNS: Array<{ path: string; type: KeyFile['type'] }> = [
   { path: 'package.json', type: 'package-manager' },
   { path: 'yarn.lock', type: 'package-manager' },
   { path: 'pnpm-lock.yaml', type: 'package-manager' },
+  { path: 'pnpm-workspace.yaml', type: 'config' },                // monorepo
+  { path: 'lerna.json', type: 'config' },                         // monorepo
+  { path: 'nx.json', type: 'config' },                            // monorepo (Nx)
+  { path: 'turbo.json', type: 'config' },                         // monorepo (Turborepo)
+  { path: 'rush.json', type: 'config' },                          // monorepo (Rush)
   // Python
   { path: 'requirements.txt', type: 'package-manager' },
   { path: 'pyproject.toml', type: 'package-manager' },
   { path: 'setup.py', type: 'package-manager' },
   { path: 'Pipfile', type: 'package-manager' },
+  { path: 'alembic.ini', type: 'config' },                        // Alembic migrations
   // Java
   { path: 'pom.xml', type: 'build-tool' },
   { path: 'build.gradle', type: 'build-tool' },
   { path: 'build.gradle.kts', type: 'build-tool' },
   { path: 'gradle.properties', type: 'config' },
-  // .NET
+  // .NET / C#
   { path: 'global.json', type: 'config' },
+  { path: 'nuget.config', type: 'config' },
+  { path: 'appsettings.json', type: 'config' },
+  { path: 'appsettings.Development.json', type: 'config' },
   // Go
   { path: 'go.mod', type: 'package-manager' },
   { path: 'go.sum', type: 'package-manager' },
   // Rust
   { path: 'Cargo.toml', type: 'package-manager' },
+  { path: 'Cargo.lock', type: 'package-manager' },
   // Ruby
   { path: 'Gemfile', type: 'package-manager' },
   { path: 'Gemfile.lock', type: 'package-manager' },
+  { path: '.ruby-version', type: 'config' },
   // PHP
   { path: 'composer.json', type: 'package-manager' },
-  // Config files
+  // Config / toolchain
   { path: '.nvmrc', type: 'config' },
   { path: '.node-version', type: 'config' },
   { path: '.python-version', type: 'config' },
@@ -382,6 +348,10 @@ const KEY_FILE_PATTERNS: Array<{ path: string; type: KeyFile['type'] }> = [
   { path: '.travis.yml', type: 'ci' },
   { path: 'Jenkinsfile', type: 'ci' },
   { path: '.circleci/config.yml', type: 'ci' },
+  { path: 'azure-pipelines.yml', type: 'ci' },
+  { path: 'azure-pipelines.yaml', type: 'ci' },
+  { path: '.gitlab-ci.yml', type: 'ci' },
+  { path: 'bitbucket-pipelines.yml', type: 'ci' },
   // Readme
   { path: 'README.md', type: 'readme' },
 ];
@@ -411,8 +381,9 @@ function detectStack(keyFiles: KeyFile[], fileTree: string[], repoLanguage: stri
     stack.containerized = true;
   }
 
-  // CI
-  if (fileMap.has('.github/workflows/main.yml') || fileMap.has('.github/workflows/ci.yml')) {
+  // CI — check specific known filenames first, then fall back to any fetched workflow
+  if (fileMap.has('.github/workflows/main.yml') || fileMap.has('.github/workflows/ci.yml')
+      || [...fileMap.keys()].some((p) => p.startsWith('.github/workflows/') && (p.endsWith('.yml') || p.endsWith('.yaml')))) {
     stack.ciSystem = 'GitHub Actions';
   } else if (fileMap.has('.travis.yml')) {
     stack.ciSystem = 'Travis CI';
@@ -420,6 +391,10 @@ function detectStack(keyFiles: KeyFile[], fileTree: string[], repoLanguage: stri
     stack.ciSystem = 'Jenkins';
   } else if (fileMap.has('.circleci/config.yml')) {
     stack.ciSystem = 'CircleCI';
+  } else if (fileMap.has('azure-pipelines.yml') || fileMap.has('azure-pipelines.yaml')) {
+    stack.ciSystem = 'Azure DevOps';
+  } else if (fileMap.has('bitbucket-pipelines.yml')) {
+    stack.ciSystem = 'Bitbucket Pipelines';
   }
 
   // Node.js / JavaScript / TypeScript
@@ -498,6 +473,16 @@ function detectStack(keyFiles: KeyFile[], fileTree: string[], repoLanguage: stri
     else if (src.includes('tornado')) { stack.framework = 'Tornado'; }
     if (src.includes('pytest')) { stack.testingFrameworks.push('pytest'); }
     if (src.includes('unittest')) { stack.testingFrameworks.push('unittest'); }
+    // Python databases & ORMs
+    if (src.includes('sqlalchemy') || src.includes('SQLAlchemy')) { stack.databases.push('SQLAlchemy'); }
+    if (src.includes('alembic')) { stack.databases.push('Alembic migrations'); }
+    if (src.includes('psycopg2') || src.includes('asyncpg')) { stack.databases.push('PostgreSQL'); }
+    if (src.includes('pymysql') || src.includes('mysqlclient')) { stack.databases.push('MySQL'); }
+    if (src.includes('pymongo') || src.includes('motor')) { stack.databases.push('MongoDB'); }
+    if (src.includes('redis') || src.includes('aioredis')) { stack.databases.push('Redis'); }
+    if (src.includes('celery')) { stack.databases.push('Celery (task queue)'); }
+    if (src.includes('tortoise-orm')) { stack.databases.push('Tortoise ORM'); }
+    if (src.includes('peewee')) { stack.databases.push('Peewee ORM'); }
     const pyVer = fileMap.get('.python-version');
     if (pyVer) {
       stack.runtime = `Python ${pyVer.trim()}`;
@@ -518,7 +503,17 @@ function detectStack(keyFiles: KeyFile[], fileTree: string[], repoLanguage: stri
     if (src.includes('spring-boot') || src.includes('spring-boot-starter')) { stack.framework = 'Spring Boot'; }
     else if (src.includes('quarkus')) { stack.framework = 'Quarkus'; }
     else if (src.includes('micronaut')) { stack.framework = 'Micronaut'; }
-
+    // Java databases, ORMs, migration tools
+    if (src.includes('spring-data') || src.includes('spring.data')) { stack.databases.push('Spring Data'); }
+    if (src.includes('hibernate') || src.includes('jakarta.persistence')) { stack.databases.push('Hibernate / JPA'); }
+    if (src.includes('flyway')) { stack.databases.push('Flyway migrations'); }
+    if (src.includes('liquibase')) { stack.databases.push('Liquibase migrations'); }
+    if (src.includes('postgresql') || src.includes('org.postgresql')) { stack.databases.push('PostgreSQL'); }
+    if (src.includes('mysql-connector') || src.includes('com.mysql')) { stack.databases.push('MySQL'); }
+    if (src.includes('mongodb') || src.includes('spring-data-mongodb')) { stack.databases.push('MongoDB'); }
+    if (src.includes('redis') || src.includes('spring-data-redis')) { stack.databases.push('Redis'); }
+    if (src.includes('jooq')) { stack.databases.push('jOOQ'); }
+    if (src.includes('mybatis')) { stack.databases.push('MyBatis'); }
     // Detect Java version from pom.xml
     const javaVerMatch = src.match(/<java\.version>([\d.]+)<\/java\.version>/) ||
       src.match(/sourceCompatibility\s*=\s*['"]?([\d.]+)/) ||
@@ -546,6 +541,16 @@ function detectStack(keyFiles: KeyFile[], fileTree: string[], repoLanguage: stri
     else if (goMod.includes('labstack/echo')) { stack.framework = 'Echo'; }
     else if (goMod.includes('gorilla/mux')) { stack.framework = 'Gorilla Mux'; }
     else if (goMod.includes('go-chi/chi')) { stack.framework = 'Chi'; }
+    else if (goMod.includes('gofiber/fiber')) { stack.framework = 'Fiber'; }
+    // Go databases
+    if (goMod.includes('gorm.io/gorm')) { stack.databases.push('GORM'); }
+    if (goMod.includes('jackc/pgx') || goMod.includes('lib/pq')) { stack.databases.push('PostgreSQL'); }
+    if (goMod.includes('go-sql-driver/mysql')) { stack.databases.push('MySQL'); }
+    if (goMod.includes('go-redis/redis') || goMod.includes('redis/go-redis')) { stack.databases.push('Redis'); }
+    if (goMod.includes('mongodb/mongo-go-driver')) { stack.databases.push('MongoDB'); }
+    if (goMod.includes('jmoiron/sqlx')) { stack.databases.push('sqlx'); }
+    if (goMod.includes('entgo.io/ent')) { stack.databases.push('ent ORM'); }
+    if (goMod.includes('golang-migrate/migrate') || goMod.includes('pressly/goose')) { stack.databases.push('DB migrations'); }
   }
 
   // Rust
@@ -559,7 +564,262 @@ function detectStack(keyFiles: KeyFile[], fileTree: string[], repoLanguage: stri
     else if (cargoToml.includes('rocket')) { stack.framework = 'Rocket'; }
   }
 
+  // .NET / C#
+  const globalJson = fileMap.get('global.json');
+  const hasCsproj = fileTree.some((f) => f.endsWith('.csproj'));
+  const slnFile = fileTree.some((f) => f.endsWith('.sln'));
+  if (globalJson || hasCsproj || slnFile) {
+    stack.primaryLanguage = 'C#';
+    stack.buildTool = 'dotnet build';
+    stack.packageManager = 'NuGet';
+    // Detect .NET version from global.json
+    try {
+      if (globalJson) {
+        const gj = JSON.parse(globalJson);
+        const sdkVersion = gj?.sdk?.version;
+        if (sdkVersion) {
+          stack.runtime = `.NET ${sdkVersion}`;
+          stack.currentVersion = `.NET ${sdkVersion}`;
+        }
+      }
+    } catch { /* ignore */ }
+    if (stack.runtime === 'Unknown') { stack.runtime = '.NET (version from global.json or .csproj)'; }
+    // Detect ASP.NET framework from any fetched .csproj content
+    const csprojContent = [...fileMap.entries()].find(([k]) => k.endsWith('.csproj'))?.[1];
+    if (csprojContent) {
+      if (csprojContent.includes('Microsoft.AspNetCore')) { stack.framework = 'ASP.NET Core'; }
+      else if (csprojContent.includes('Blazor')) { stack.framework = 'Blazor'; }
+      else { stack.framework = '.NET Application'; }
+      // Detect target framework
+      const tfmMatch = csprojContent.match(/<TargetFramework>(net[\d.]+)<\/TargetFramework>/);
+      if (tfmMatch) { stack.runtime = tfmMatch[1]; stack.currentVersion = tfmMatch[1]; }
+    } else {
+      stack.framework = 'ASP.NET Core';
+    }
+  }
+
+  // Ruby
+  const gemfile = fileMap.get('Gemfile');
+  if (gemfile) {
+    stack.primaryLanguage = 'Ruby';
+    stack.packageManager = 'Bundler';
+    stack.buildTool = 'rake';
+    if (gemfile.includes("'rails'") || gemfile.includes('"rails"')) { stack.framework = 'Ruby on Rails'; }
+    else if (gemfile.includes("'sinatra'")) { stack.framework = 'Sinatra'; }
+    if (gemfile.includes("'rspec'") || gemfile.includes('"rspec"')) { stack.testingFrameworks.push('RSpec'); }
+    if (gemfile.includes("'minitest'")) { stack.testingFrameworks.push('Minitest'); }
+    const rubyVer = fileMap.get('.ruby-version');
+    if (rubyVer) { stack.runtime = `Ruby ${rubyVer.trim()}`; stack.currentVersion = `Ruby ${rubyVer.trim()}`; }
+    else { stack.runtime = 'Ruby (version unspecified)'; }
+  }
+
+  // PHP
+  const composerJson = fileMap.get('composer.json');
+  if (composerJson) {
+    stack.primaryLanguage = 'PHP';
+    stack.packageManager = 'Composer';
+    stack.buildTool = 'composer';
+    try {
+      const comp = JSON.parse(composerJson);
+      const allDeps = { ...comp.require, ...comp['require-dev'] };
+      if (allDeps['laravel/framework']) { stack.framework = `Laravel ${allDeps['laravel/framework']}`; }
+      else if (allDeps['symfony/symfony'] || allDeps['symfony/framework-bundle']) { stack.framework = 'Symfony'; }
+      else if (allDeps['slim/slim']) { stack.framework = 'Slim'; }
+      const phpVer = allDeps['php'];
+      if (phpVer) { stack.runtime = `PHP ${phpVer}`; stack.currentVersion = `PHP ${phpVer}`; }
+      else { stack.runtime = 'PHP (version unspecified)'; }
+      if (allDeps['phpunit/phpunit']) { stack.testingFrameworks.push('PHPUnit'); }
+      if (allDeps['pestphp/pest']) { stack.testingFrameworks.push('Pest'); }
+      // Databases
+      if (allDeps['doctrine/orm'] || allDeps['doctrine/dbal']) { stack.databases.push('Doctrine ORM'); }
+      if (allDeps['illuminate/database']) { stack.databases.push('Eloquent ORM'); }
+    } catch { /* ignore */ }
+  }
+
+  // ── Monorepo detection ────────────────────────────────────────────────────
+  // Monorepo tools are language-agnostic and override nothing — they add context
+  const monoMarkers: Array<[string, string]> = [
+    ['lerna.json', 'Lerna'],
+    ['nx.json', 'Nx'],
+    ['turbo.json', 'Turborepo'],
+    ['rush.json', 'Rush'],
+    ['pnpm-workspace.yaml', 'pnpm workspaces'],
+  ];
+  const monoTool = monoMarkers.find(([f]) => fileMap.has(f));
+  if (monoTool) {
+    // Annotate framework with monorepo context rather than overwriting it
+    const suffix = ` [monorepo: ${monoTool[1]}]`;
+    stack.framework = stack.framework ? `${stack.framework}${suffix}` : monoTool[1];
+  } else {
+    // Check package.json workspaces field for npm/yarn monorepos
+    try {
+      const pkgJson = fileMap.get('package.json');
+      if (pkgJson) {
+        const pkg = JSON.parse(pkgJson);
+        if (Array.isArray(pkg.workspaces)) {
+          const suffix = ' [monorepo: npm/yarn workspaces]';
+          stack.framework = stack.framework ? `${stack.framework}${suffix}` : 'Node.js monorepo';
+        }
+      }
+    } catch { /* ignore */ }
+  }
+
   return stack;
+}
+
+// ─── Environment Variable Scanner ────────────────────────────────────────────
+
+/**
+ * Scans source and config files for every environment variable reference
+ * across all major languages. Returns a deduplicated list sorted by usage count.
+ */
+export function scanEnvVarUsages(keyFiles: KeyFile[]): EnvVarUsage[] {
+  const varMap = new Map<string, { files: Set<string>; defaultValue?: string }>();
+
+  // Each entry: [regex, nameGroup, defaultValueGroup | undefined]
+  // All regexes use named or positional groups — nameGroup is always 1.
+  const patterns: Array<[RegExp, number, number | undefined]> = [
+    // JS / TS: process.env.VAR or process.env['VAR']
+    [/process\.env\.([A-Z_][A-Z0-9_]+)/g, 1, undefined],
+    [/process\.env\[['"]([A-Z_][A-Z0-9_]+)['"]\]/g, 1, undefined],
+    // Python: os.getenv('VAR', 'default') or os.environ.get('VAR') or os.environ['VAR']
+    [/os\.getenv\(['"]([A-Z_][A-Z0-9_]+)['"](?:,\s*['"]([^'"]*)['"'])?\)/g, 1, 2],
+    [/os\.environ\.get\(['"]([A-Z_][A-Z0-9_]+)['"](?:,\s*['"]([^'"]*)['"'])?\)/g, 1, 2],
+    [/os\.environ\[['"]([A-Z_][A-Z0-9_]+)['"]\]/g, 1, undefined],
+    // Java / Kotlin: System.getenv("VAR")
+    [/System\.getenv\(["']([A-Z_][A-Z0-9_]+)["']\)/g, 1, undefined],
+    // Go: os.Getenv("VAR")
+    [/os\.Getenv\(["']([A-Z_][A-Z0-9_]+)["']\)/g, 1, undefined],
+    // Ruby: ENV['VAR'] or ENV["VAR"] or ENV.fetch('VAR', 'default')
+    [/ENV\[['"]([A-Z_][A-Z0-9_]+)['"]\]/g, 1, undefined],
+    [/ENV\.fetch\(['"]([A-Z_][A-Z0-9_]+)['"](?:,\s*['"]([^'"]*)['"'])?\)/g, 1, 2],
+    // PHP: getenv('VAR') or $_ENV['VAR'] or $_SERVER['VAR']
+    [/getenv\(['"]([A-Z_][A-Z0-9_]+)['"]\)/g, 1, undefined],
+    [/\$_ENV\[['"]([A-Z_][A-Z0-9_]+)['"]\]/g, 1, undefined],
+    [/\$_SERVER\[['"]([A-Z_][A-Z0-9_]+)['"]\]/g, 1, undefined],
+    // .NET: Environment.GetEnvironmentVariable("VAR")
+    [/Environment\.GetEnvironmentVariable\(["']([A-Za-z_][A-Za-z0-9_]+)["']\)/g, 1, undefined],
+    // Rust: env::var("VAR")
+    [/env::var\(["']([A-Z_][A-Z0-9_]+)["']\)/g, 1, undefined],
+  ];
+
+  for (const file of keyFiles) {
+    if (file.type !== 'source' && file.type !== 'config' && file.type !== 'ci') { continue; }
+    const content = file.content;
+
+    for (const [re, nameGroup, defaultGroup] of patterns) {
+      re.lastIndex = 0;
+      let m: RegExpExecArray | null;
+      while ((m = re.exec(content)) !== null) {
+        const name = m[nameGroup];
+        if (!name || name.length < 2) { continue; }
+
+        if (!varMap.has(name)) {
+          varMap.set(name, { files: new Set() });
+        }
+        const entry = varMap.get(name)!;
+        entry.files.add(file.path);
+        if (defaultGroup && m[defaultGroup] && !entry.defaultValue) {
+          entry.defaultValue = m[defaultGroup];
+        }
+      }
+    }
+  }
+
+  return Array.from(varMap.entries())
+    .map(([name, { files, defaultValue }]) => ({
+      name,
+      files: Array.from(files),
+      ...(defaultValue !== undefined ? { defaultValue } : {}),
+    }))
+    .sort((a, b) => b.files.length - a.files.length); // most-referenced first
+}
+
+// ─── Dependency Usage Analyzer ────────────────────────────────────────────────
+
+/**
+ * For each production/dev dependency, counts how many source files actually
+ * import it. Helps identify truly unused deps and surface the most critical ones.
+ */
+export function analyzeDependencyUsage(
+  deps: Record<string, string>,
+  keyFiles: KeyFile[]
+): Record<string, { usageCount: number; files: string[] }> {
+  const result: Record<string, { usageCount: number; files: string[] }> = {};
+  const sourceFiles = keyFiles.filter((f) => f.type === 'source');
+
+  for (const [name] of Object.entries(deps).slice(0, 40)) {
+    // Build a regex-safe version of the package name (handles @org/pkg, hyphens, dots)
+    const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    // Match: import '...name...', require('...name...'), from '...name...'
+    const re = new RegExp(`(?:import|require|from)\\s+['"\`]${escaped}(?:[/'"\`]|$)`, 'i');
+
+    const matchingFiles: string[] = [];
+    for (const file of sourceFiles) {
+      if (re.test(file.content)) {
+        matchingFiles.push(file.path);
+      }
+    }
+    result[name] = { usageCount: matchingFiles.length, files: matchingFiles };
+  }
+
+  return result;
+}
+
+// ─── Monorepo Package Detector ────────────────────────────────────────────────
+
+/**
+ * Reads workspace configuration files (pnpm-workspace.yaml, lerna.json,
+ * package.json#workspaces) to enumerate individual package names in a monorepo.
+ */
+export function detectMonorepoPackages(fileTree: string[], keyFiles: KeyFile[]): string[] {
+  const fileMap = new Map(keyFiles.map((f) => [f.path, f.content]));
+  const packages = new Set<string>();
+
+  // Helper: given a glob prefix like "packages/", find matching package dirs
+  const findPackagesUnderPrefix = (prefix: string): string[] => {
+    const clean = prefix.replace(/\*.*$/, '').replace(/\/$/, '') + '/';
+    return fileTree
+      .filter((p) => p.startsWith(clean) && p.endsWith('/package.json'))
+      .map((p) => p.slice(clean.length).split('/')[0])
+      .filter(Boolean);
+  };
+
+  // pnpm-workspace.yaml
+  const pnpmWs = fileMap.get('pnpm-workspace.yaml');
+  if (pnpmWs) {
+    const globs = [...pnpmWs.matchAll(/['"]([^'"]+\*[^'"]*)['"]/g)].map((m) => m[1]);
+    for (const g of globs) {
+      findPackagesUnderPrefix(g).forEach((p) => packages.add(p));
+    }
+  }
+
+  // lerna.json
+  const lernaJson = fileMap.get('lerna.json');
+  if (lernaJson) {
+    try {
+      const lerna = JSON.parse(lernaJson);
+      for (const pattern of (lerna.packages as string[] | undefined) ?? []) {
+        findPackagesUnderPrefix(pattern).forEach((p) => packages.add(p));
+      }
+    } catch { /* ignore */ }
+  }
+
+  // package.json#workspaces (npm / Yarn / Nx)
+  const pkgJson = fileMap.get('package.json');
+  if (pkgJson) {
+    try {
+      const pkg = JSON.parse(pkgJson);
+      const workspaces: string[] = Array.isArray(pkg.workspaces)
+        ? pkg.workspaces
+        : (pkg.workspaces?.packages ?? []);
+      for (const pattern of workspaces) {
+        findPackagesUnderPrefix(pattern).forEach((p) => packages.add(p));
+      }
+    } catch { /* ignore */ }
+  }
+
+  return [...packages].sort();
 }
 
 // ─── Main Analyzer ────────────────────────────────────────────────────────────
@@ -593,8 +853,15 @@ export async function analyzeRepository(
 
   // Also find CI workflows
   const ciWorkflows = fileTree.filter((f) =>
-    f.startsWith('.github/workflows/') && f.endsWith('.yml') && !isIgnoredByMigrationIgnore(f, ignoreRules)
-  ).slice(0, 2);
+    f.startsWith('.github/workflows/') && (f.endsWith('.yml') || f.endsWith('.yaml')) && !isIgnoredByMigrationIgnore(f, ignoreRules)
+  ).slice(0, 5);
+
+  // .NET: dynamically find *.csproj files (can't be listed statically in KEY_FILE_PATTERNS)
+  const csprojFiles = fileTree
+    .filter((f) => f.endsWith('.csproj') && !isIgnoredByMigrationIgnore(f, ignoreRules)
+      && !existingKeyFiles.some((kf) => kf.path === f))
+    .slice(0, 3)
+    .map((p) => ({ path: p, type: 'build-tool' as KeyFile['type'] }));
 
   // Collect ALL source files up to MAX_SOURCE_FILES — these are what the
   // chunked LLM analysis will process. We sort by path length (shallowest/most
@@ -602,6 +869,7 @@ export async function analyzeRepository(
   const MAX_SOURCE_FILES = 80;
   const configPaths = new Set<string>([
     ...existingKeyFiles.map((kf) => kf.path),
+    ...csprojFiles.map((c) => c.path),
     ...ciWorkflows,
   ]);
   const allSourceFiles = fileTree
@@ -619,6 +887,7 @@ export async function analyzeRepository(
 
   const allToFetch: Array<{ path: string; type: KeyFile['type'] }> = [
     ...existingKeyFiles,
+    ...csprojFiles.filter((c) => !existingKeyFiles.some((kf) => kf.path === c.path)),
     ...ciWorkflows
       .filter((p) => !existingKeyFiles.some((kf) => kf.path === p))
       .map((p) => ({ path: p, type: 'ci' as KeyFile['type'] })),
@@ -645,9 +914,10 @@ export async function analyzeRepository(
         if (!raw) { return null; }
 
         // Config files can be large (lock files etc.) — truncate generously.
-        // Source files get a smaller cap; the chunked LLM analysis works per file
-        // so having every file read is more important than having each read fully.
-        const limit = type === 'source' ? 4000 : 8000;
+        // Source files: 6 000 chars gives ~150 lines of code — enough to capture
+        // class/function signatures, key imports, and representative logic for
+        // accurate before/after migration examples.
+        const limit = type === 'source' ? 6000 : 8000;
         const truncated = raw.length > limit ? raw.slice(0, limit) + '\n... (truncated)' : raw;
 
         // Redact secrets from the content
@@ -669,6 +939,12 @@ export async function analyzeRepository(
   };
 
   const detectedStack = detectStack(keyFiles, fileTree, repoInfo.language);
+  const envVarInventory = scanEnvVarUsages(keyFiles);
+  const dependencyUsage = analyzeDependencyUsage(
+    { ...detectedStack.dependencies, ...detectedStack.devDependencies },
+    keyFiles
+  );
+  const monorepoPackages = detectMonorepoPackages(fileTree, keyFiles);
 
   return {
     repoInfo,
@@ -677,6 +953,9 @@ export async function analyzeRepository(
     fileTree,
     totalFiles: fileTree.length,
     redactionSummary,
+    ...(envVarInventory.length > 0 ? { envVarInventory } : {}),
+    ...(Object.keys(dependencyUsage).length > 0 ? { dependencyUsage } : {}),
+    ...(monorepoPackages.length > 0 ? { monorepoPackages } : {}),
   };
 }
 

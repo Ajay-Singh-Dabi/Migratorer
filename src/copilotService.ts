@@ -96,10 +96,10 @@ function buildContext(analysis: RepoAnalysis, targetStack: string): string {
   const devDepsList = Object.entries(maskedDevDeps).slice(0, 12)
     .map(([k, v]) => `  ${k}: ${v}`).join('\n');
 
-  // Short file snippets — include all fetched files so the AI sees the full sample
+  // File snippets — config + key source files, 1000 chars each (enough for real before/after examples)
   const fileSnippets = keyFiles.slice(0, 25)
     .map(f => {
-      const safe = f.content.replace(/\[REDACTED:[^\]]*\]/g, '""').slice(0, 400);
+      const safe = f.content.replace(/\[REDACTED:[^\]]*\]/g, '""').slice(0, 1000);
       return `${f.path}:\n${safe}`;
     }).join('\n\n---\n\n');
 
@@ -126,6 +126,30 @@ function buildContext(analysis: RepoAnalysis, targetStack: string): string {
     .map(([folder, files]) => `  ${folder}/  (${files.length} files)`)
     .join('\n');
 
+  // ── Env var inventory ─────────────────────────────────────────────────────
+  const envVarLines = analysis.envVarInventory?.length
+    ? analysis.envVarInventory.slice(0, 30).map((v) =>
+        `  ${v.name}${v.defaultValue !== undefined ? ` (default: "${v.defaultValue}")` : ''} — ${v.files.slice(0, 3).join(', ')}${v.files.length > 3 ? ` +${v.files.length - 3} more` : ''}`
+      ).join('\n')
+    : null;
+
+  // ── Dependency usage summary ───────────────────────────────────────────────
+  const depUsageLines = (() => {
+    if (!analysis.dependencyUsage) { return null; }
+    const entries = Object.entries(analysis.dependencyUsage);
+    const heavy = entries.filter(([, v]) => v.usageCount >= 5).map(([k, v]) => `${k} (${v.usageCount} files)`);
+    const unused = entries.filter(([, v]) => v.usageCount === 0).map(([k]) => k);
+    const parts: string[] = [];
+    if (heavy.length) { parts.push(`  Heavily imported (≥5 files): ${heavy.slice(0, 8).join(', ')}`); }
+    if (unused.length) { parts.push(`  Possibly unused (no imports detected): ${unused.slice(0, 8).join(', ')}`); }
+    return parts.length ? parts.join('\n') : null;
+  })();
+
+  // ── Monorepo packages ──────────────────────────────────────────────────────
+  const monorepoLine = analysis.monorepoPackages?.length
+    ? `Monorepo packages (${analysis.monorepoPackages.length}): ${analysis.monorepoPackages.join(', ')}`
+    : null;
+
   return `Project: ${repoInfo.owner}/${repoInfo.repo}
 Language: ${repoInfo.language} | Files: ${analysis.totalFiles} | Size: ${repoInfo.size} KB
 Migration target: ${targetStack}
@@ -146,25 +170,28 @@ ${depsList || '  (none)'}
 
 Dev dependencies:
 ${devDepsList || '  (none)'}
+${depUsageLines ? `\nDependency usage analysis (based on actual imports in source files):\n${depUsageLines}` : ''}
+${monorepoLine ? `\n${monorepoLine}` : ''}
+${envVarLines ? `\nEnvironment variables discovered in source code (${analysis.envVarInventory!.length} unique — use this as the authoritative list for Section 10 CI/CD and Section 5 config migration):\n${envVarLines}` : ''}
 
 Module structure (top-level folders):
 ${folderSummary}
 
-Key files (short excerpt):
-${fileSnippets || '(none)'}
-
-Full project file tree (all folders and files):
-${fileTreeSection}${treeTruncNote}
-
-IMPORTANT: Any file path you mention in your output MUST come from the file tree above. Do not invent file names.
-
 ${analysis.chunkSummaries?.length
-  ? `─── Full Codebase Analysis (${analysis.keyFiles.filter(f => f.type === 'source').length} source files analyzed in ${analysis.chunkSummaries.length} groups) ───
+  ? `─── Full Codebase Analysis (${analysis.keyFiles.filter(f => f.type === 'source').length} source files in ${analysis.chunkSummaries.length} groups — PRIMARY REFERENCE for code patterns and migration decisions) ───
 
 ${analysis.chunkSummaries.map((cs) =>
   `Group ${cs.chunkIndex + 1} — files: ${cs.files.join(', ')}\n${cs.summary}`
 ).join('\n\n---\n\n')}`
-  : '(Run "Generate Plan" to trigger full codebase analysis)'}`;
+  : '(Full codebase analysis not yet run — generate the plan to trigger it)'}
+
+Key files (first 1000 chars each — use these for exact before/after code examples):
+${fileSnippets || '(none)'}
+
+Full project file tree:
+${fileTreeSection}${treeTruncNote}
+
+IMPORTANT: Any file path you mention in your output MUST come from the file tree above. Do not invent file names.`;
 }
 
 // ─── Section definitions ───────────────────────────────────────────────────────
@@ -305,7 +332,18 @@ Then write the step-by-step guide. For each step:
 **Verify:** \`[command]\` → [expected output]
 **Rollback:** \`[exact command to undo this step — e.g. git revert, npm install old-package, restore backup, or git checkout -- <file>]\`
 
-Write at least 12 steps covering: dependencies → config → routes → services → models → tests → CI/CD → build → deploy. Every file path must exist in the file tree above.`,
+Write at least 12 steps covering: dependencies → config → routes → services → models → tests → CI/CD → build → deploy. Every file path must exist in the file tree above.
+
+Additionally, include a dedicated step:
+
+### Step N: Migrate Environment Variables & Config
+**Why:** The environment variable inventory in the context above lists every env var the codebase reads. Each must be mapped to its correct name/location in the target stack — mismatches cause silent startup failures.
+**For each env var in the inventory:**
+- Current name and where it's read (from the inventory above)
+- Target name in ${targetStack} (if renamed)
+- Where to set it (CI secrets, .env.example, deployment config)
+**Verify:** \`[command to check all required vars are present at startup]\`
+**Rollback:** restore original .env.example and revert config file`,
     },
     // ── Section 6: Dependencies ───────────────────────────────────────────────
     {
@@ -402,7 +440,11 @@ Provide a complete, ready-to-commit YAML covering: install, lint, type-check, te
 # complete pipeline
 \`\`\`
 
-List every required environment variable, its purpose, and where to store it.
+**Environment variables table — use the inventory from the context above as your authoritative source.** List every env var discovered there, plus any new ones the target stack requires:
+
+| Variable | Purpose | Store in | Required for |
+|----------|---------|----------|--------------|
+(one row per env var from the inventory above — do not omit any)
 
 Add a **migration safety gate** job that runs before deploy: it must run all database migrations in a dry-run or against a staging environment and fail the pipeline if any migration errors. Show the YAML job definition.`,
       condition: options.includeCiMigration,
@@ -545,11 +587,29 @@ Cover at least 25 items across these categories:
     {
       heading: '## 16. Phased Migration Schedule',
       ask: `Break this migration into 3 phases based on the actual file inventory. Every phase must be independently deployable to production — no "big-bang" all-at-once approach.
-
+${analysis.monorepoPackages?.length
+  ? `
+### Monorepo Package Migration Order
+This repo contains ${analysis.monorepoPackages.length} packages: ${analysis.monorepoPackages.join(', ')}.
+Before the phase breakdown, list the recommended migration order for these packages with justification:
+- Which packages have no internal dependents and can migrate first (leaf nodes)?
+- Which packages are shared utilities that everything depends on (must migrate last or be kept backwards-compatible)?
+- Are any packages tightly coupled and must migrate together in the same phase?
+Format as a numbered ordered list with one sentence of justification per package.
+`
+  : ''}
 ### Phase 1 — Foundation (ships to production independently, zero breaking changes)
 **Goal:** Set up the new toolchain alongside the old stack. No user-facing changes.
 **Duration:** [estimate]
-**Go/No-Go criteria:** [what must be true before starting Phase 2]
+**Go/No-Go criteria for Phase 2 (ALL must be true — check each explicitly):**
+- [ ] New toolchain installs without errors (\`[exact verification command]\`)
+- [ ] CI runs both old and new linters/type-checkers in parallel, both green
+- [ ] Baseline test suite collected on new stack (failures listed, not blocking)
+- [ ] Test coverage baseline measured: \`[coverage command]\` → record the % number
+${analysis.envVarInventory?.length
+  ? `- [ ] All ${analysis.envVarInventory.length} env vars from the inventory documented in \`.env.example\` with their target-stack names`
+  : '- [ ] All required env vars documented in `.env.example`'}
+- [ ] No production traffic has seen the new stack yet
 
 Numbered task list with exact file paths, terminal commands, and verification steps. Include:
 - Dependency installs (exact command)
@@ -561,7 +621,17 @@ Numbered task list with exact file paths, terminal commands, and verification st
 ### Phase 2 — Core Migration (feature branch, breaking changes)
 **Goal:** Migrate all application logic. Traffic still 100% on old stack.
 **Duration:** [estimate]
-**Go/No-Go criteria:** [what must be true before starting Phase 3 — minimum: test suite passes, staging deployment verified]
+**Go/No-Go criteria for Phase 3 (ALL must be true — check each explicitly):**
+- [ ] Test suite passes on new stack: \`[test command]\` → exit 0
+- [ ] Coverage ≥ 70% (or the baseline from Phase 1 — do not regress): \`[coverage command]\` → [X]%
+- [ ] Staging deployment succeeds and health endpoint returns 200: \`[health check command]\`
+- [ ] All breaking changes from Section 3 resolved — no old import patterns remain: \`[grep command to verify]\`
+${analysis.envVarInventory?.length
+  ? `- [ ] All ${analysis.envVarInventory.length} env vars configured in staging environment`
+  : '- [ ] All env vars configured in staging environment'}
+- [ ] Database schema expand phase (Section 8) applied to staging with no errors
+- [ ] End-to-end test suite passes on staging: \`[e2e command]\`
+- [ ] Rollback rehearsed: manually triggered rollback and verified old stack resumes correctly
 
 Numbered task list referencing the breaking changes from Section 3 and steps from Section 5. Include:
 - Order of file migrations (reference exact paths from Section 5 file inventory)
@@ -572,7 +642,22 @@ Numbered task list referencing the breaking changes from Section 3 and steps fro
 ### Phase 3 — Hardening & Cutover (production traffic shift)
 **Goal:** Migrate production traffic using the cutover strategy from Section 13.
 **Duration:** [estimate]
-**Go/No-Go criteria:** [all Phase 2 criteria met + performance baseline on staging verified + rollback plan rehearsed]
+**Go/No-Go criteria to begin traffic shift (ALL must be true — check each explicitly):**
+- [ ] All Phase 2 criteria met
+- [ ] Performance baseline verified on staging: P95 latency ≤ [baseline]ms, error rate < 0.1%
+- [ ] Rollback plan rehearsed end-to-end (not just read — actually executed on staging)
+- [ ] On-call engineer briefed with rollback trigger criteria from Section 13.5
+- [ ] Monitoring dashboard from Section 14 live and showing green for ≥ 30 minutes
+- [ ] DNS TTL reduced to 60 seconds ≥ 1 hour before cutover
+
+**Criteria to declare migration complete (soak period gate):**
+- [ ] 100% traffic on new stack for ≥ [Section 14.6 soak duration]
+- [ ] HTTP 5xx rate < 0.1% for entire soak period
+- [ ] P95 latency ≤ baseline + 20ms for entire soak period
+${analysis.envVarInventory?.length
+  ? `- [ ] All ${analysis.envVarInventory.length} env vars confirmed present in production (startup log check)`
+  : '- [ ] All env vars confirmed present in production'}
+- [ ] Post-migration checklist from Section 15 completed with all items passing
 
 Numbered task list including:
 - Contract phase of database migration (reference Section 8)
@@ -675,6 +760,10 @@ async function tryStream(
  *   Attempt 1 — full prompt with file snippets (token-limited)
  *   Attempt 2 — metadata-only prompt (no file content)
  *   Attempt 3 — ultra-minimal plain-english request
+ *
+ * Token trimming strategy: the prompt is "context + separator + ask".
+ * We ALWAYS preserve the full section ask (it defines what to produce).
+ * Only the context portion is trimmed when the combined prompt is too long.
  */
 async function streamWithFallback(
   model: vscode.LanguageModelChat,
@@ -684,15 +773,47 @@ async function streamWithFallback(
   onChunk: (chunk: string) => void,
   cancellationToken: vscode.CancellationToken
 ): Promise<void> {
-  // Trim full prompt to token limit before first attempt
   const TOKEN_LIMIT = 10_000;
   let prompt = fullPrompt;
   const tokenCount = await countTokens(model, prompt);
+
   if (tokenCount > TOKEN_LIMIT) {
-    const ratio = TOKEN_LIMIT / tokenCount;
-    const trimmed = prompt.slice(0, Math.floor(prompt.length * ratio * 0.85));
-    const fences = (trimmed.match(/```/g) || []).length;
-    prompt = fences % 2 !== 0 ? trimmed + '\n```\n' : trimmed;
+    // All section prompts are structured as:
+    //   [system preamble + context] \n\n---\n\n [section ask]
+    // We MUST preserve the ask — it defines what the model produces.
+    // Only trim the context, never the ask.
+    const SEPARATOR = '\n\n---\n\n';
+    const sepIdx = prompt.lastIndexOf(SEPARATOR);
+
+    if (sepIdx > 0) {
+      const askPart     = prompt.slice(sepIdx);           // separator + ask (never trimmed)
+      const contextPart = prompt.slice(0, sepIdx);        // preamble + context (trim here)
+
+      const askTokens = await countTokens(model, askPart);
+      const ctxBudget = TOKEN_LIMIT - askTokens - 200;    // 200-token safety buffer
+
+      if (ctxBudget > 500) {
+        // There is usable context budget — trim to fit
+        const ctxTokens = await countTokens(model, contextPart);
+        if (ctxTokens > ctxBudget) {
+          const ratio = ctxBudget / ctxTokens;
+          let trimmedCtx = contextPart.slice(0, Math.floor(contextPart.length * ratio * 0.9));
+          // Close any unclosed code fences that the trim split open
+          const fences = (trimmedCtx.match(/```/g) || []).length;
+          if (fences % 2 !== 0) { trimmedCtx += '\n```'; }
+          prompt = trimmedCtx + askPart;
+        }
+      } else {
+        // Ask already consumes nearly the full budget — fall back to metadata prompt
+        prompt = fallbackPrompt;
+      }
+    } else {
+      // No separator detected (shouldn't happen for plan sections) — trim from end
+      const ratio = TOKEN_LIMIT / tokenCount;
+      const trimmed = prompt.slice(0, Math.floor(prompt.length * ratio * 0.85));
+      const fences = (trimmed.match(/```/g) || []).length;
+      prompt = fences % 2 !== 0 ? trimmed + '\n```\n' : trimmed;
+    }
   }
 
   if (await tryStream(model, prompt, onChunk, cancellationToken)) { return; }
@@ -771,46 +892,258 @@ export async function analyzeFilesInChunks(
 
 // ─── Main Service ─────────────────────────────────────────────────────────────
 
+/**
+ * Stream the full 16-section migration plan.
+ * Returns the headings of any sections that could not be generated after retry.
+ *
+ * @param onSectionStart  Called before each section starts — index/total for progress UI.
+ */
 export async function streamMigrationPlan(
   analysis: RepoAnalysis,
   targetStack: string,
   options: AnalysisOptions,
   onChunk: (chunk: string) => void,
-  cancellationToken: vscode.CancellationToken
-): Promise<void> {
+  cancellationToken: vscode.CancellationToken,
+  onSectionStart?: (index: number, total: number, heading: string) => void
+): Promise<string[]> {
   const model   = await selectModel();
   const context = buildContext(analysis, targetStack);
   const metadataContext = buildContext({ ...analysis, keyFiles: [] }, targetStack);
   const sections = buildSections(analysis, targetStack, options);
+  const failedSections: string[] = [];
 
-  for (const section of sections) {
+  for (let i = 0; i < sections.length; i++) {
+    const section = sections[i];
     if (cancellationToken.isCancellationRequested) { break; }
 
-    // Emit the section heading immediately so the user sees progress
+    // Notify the UI which section is starting so it can show progress
+    onSectionStart?.(i, sections.length, section.heading);
+
+    // Emit the section heading immediately so the user sees forward motion
     onChunk(`\n\n${section.heading}\n\n`);
 
-    // Each request = shared context + focused single-section ask
-    const prompt = `You are a senior software architect producing one section of a professional migration plan. Be precise and actionable. Every file path you mention must exist in the file tree provided. Every package name must come from the dependency list. Do not invent placeholders.
+    const sysPrefix = `You are a senior software architect producing one section of a professional migration plan. Be precise and actionable. Every file path you mention must exist in the file tree provided. Every package name must come from the dependency list. Do not invent placeholders.`;
 
-${context}
+    const prompt         = `${sysPrefix}\n\n${context}\n\n---\n\n${section.ask}`;
+    const metadataPrompt = `${sysPrefix}\n\n${metadataContext}\n\n---\n\n${section.ask}`;
+    const minimalPrompt  = `Write the "${section.heading.replace(/^#+\s*/, '')}" section of a migration plan from ${analysis.detectedStack.framework} to ${targetStack}. Be specific and include code examples.`;
 
----
+    // Try to generate the section. If it produces nothing (or fails), retry
+    // once with the fallback prompt before marking it as failed.
+    let sectionContent = '';
+    const captureChunk = (c: string) => { sectionContent += c; onChunk(c); };
 
-${section.ask}`;
+    let succeeded = false;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      if (cancellationToken.isCancellationRequested) { break; }
+      sectionContent = '';
+      try {
+        if (attempt === 0) {
+          await streamWithFallback(model, prompt, metadataPrompt, minimalPrompt, captureChunk, cancellationToken);
+        } else {
+          // Second attempt: simpler minimal prompt, give the model a clean shot
+          await tryStream(model, minimalPrompt, captureChunk, cancellationToken);
+        }
+        if (sectionContent.trim().length > 80) {
+          succeeded = true;
+          break;
+        }
+        // Content is too short — retry
+      } catch {
+        // Unexpected error — retry once
+      }
+    }
 
-    // Fallback: same ask but without file snippets to reduce token usage
-    const metadataPrompt = `You are a senior software architect producing one section of a professional migration plan. Be precise and actionable. Every package name must come from the dependency list provided.
-
-${metadataContext}
-
----
-
-${section.ask}`;
-
-    const minimalPrompt = `Write the "${section.heading.replace(/^#+\s*/, '')}" section of a migration plan from ${analysis.detectedStack.framework} to ${targetStack}. Be specific and include code examples.`;
-
-    await streamWithFallback(model, prompt, metadataPrompt, minimalPrompt, onChunk, cancellationToken);
+    if (!succeeded && !cancellationToken.isCancellationRequested) {
+      const failureNotice =
+        `\n\n> **⚠️ This section could not be generated.** ` +
+        `To retry, type in chat: **"regenerate ${section.heading.replace(/^#+\s*/, '')}"**\n`;
+      onChunk(failureNotice);
+      failedSections.push(section.heading.replace(/^#+\s*/, ''));
+    }
   }
+
+  return failedSections;
+}
+
+// ─── Single Section Retry ─────────────────────────────────────────────────────
+
+/**
+ * Re-generates a single named section of the plan.
+ * Used by the retry-section feature when a section fails during plan generation.
+ *
+ * @param sectionHeading  Heading text to match, e.g. "5. Step-by-Step Migration Guide"
+ * @returns true if the section was generated with sufficient content (>80 chars)
+ */
+export async function streamSingleSection(
+  analysis: RepoAnalysis,
+  targetStack: string,
+  options: AnalysisOptions,
+  sectionHeading: string,
+  onChunk: (chunk: string) => void,
+  cancellationToken: vscode.CancellationToken
+): Promise<boolean> {
+  const model   = await selectModel();
+  const context = buildContext(analysis, targetStack);
+  const metadataContext = buildContext({ ...analysis, keyFiles: [] }, targetStack);
+  const sections  = buildSections(analysis, targetStack, options);
+
+  const norm = (s: string) => s.replace(/^#+\s*/, '').toLowerCase().trim();
+  const target = sectionHeading ? norm(sectionHeading) : '';
+  const section = sections.find(
+    (s) => norm(s.heading) === target || norm(s.heading).includes(target) || target.includes(norm(s.heading))
+  );
+
+  if (!section) { return false; }
+
+  const sysPrefix =
+    `You are a senior software architect producing one section of a professional migration plan. ` +
+    `Be precise and actionable. Every file path you mention must exist in the file tree provided. ` +
+    `Every package name must come from the dependency list. Do not invent placeholders.`;
+
+  const prompt         = `${sysPrefix}\n\n${context}\n\n---\n\n${section.ask}`;
+  const metadataPrompt = `${sysPrefix}\n\n${metadataContext}\n\n---\n\n${section.ask}`;
+  const minimalPrompt  =
+    `Write the "${norm(section.heading)}" section of a migration plan from ` +
+    `${analysis.detectedStack.framework} to ${targetStack}. Be specific and include code examples.`;
+
+  let content = '';
+  const capture = (c: string) => { content += c; onChunk(c); };
+  await streamWithFallback(model, prompt, metadataPrompt, minimalPrompt, capture, cancellationToken);
+  return content.trim().length > 80;
+}
+
+// ─── Plan Coherence Check ─────────────────────────────────────────────────────
+
+/**
+ * Runs a post-generation validation pass over the completed migration plan.
+ * Checks for contradictions between sections, invented file paths, version
+ * mismatches, and files in the repo that were never addressed.
+ *
+ * This is intentionally non-blocking: callers must wrap it in try/catch so
+ * a failure here never prevents the plan from being shown to the user.
+ */
+export async function streamCoherenceCheck(
+  analysis: RepoAnalysis,
+  targetStack: string,
+  fullPlan: string,
+  onChunk: (chunk: string) => void,
+  cancellationToken: vscode.CancellationToken
+): Promise<void> {
+  const model = await selectModel();
+  const { safe: safeTree } = filterFileTree(analysis.fileTree);
+  const realPaths = safeTree.slice(0, 400).join('\n');
+
+  // Build a condensed plan summary that covers ALL 16 sections regardless of plan length.
+  // Strategy: extract each section heading + first 300 chars of its body. This keeps
+  // the coherence check within token budget while giving the model a view of every section.
+  const MAX_PLAN_CHARS = 12_000;
+  let planSample: string;
+  if (fullPlan.length <= MAX_PLAN_CHARS) {
+    planSample = fullPlan;
+  } else {
+    // Extract heading + snippet per section so every section is represented
+    const sectionRegex = /^(#{1,3} .+)$/gm;
+    const headings: Array<{ heading: string; start: number }> = [];
+    let m: RegExpExecArray | null;
+    while ((m = sectionRegex.exec(fullPlan)) !== null) {
+      headings.push({ heading: m[1], start: m.index });
+    }
+    const condensed = headings.map(({ heading, start }, idx) => {
+      const end = idx + 1 < headings.length ? headings[idx + 1].start : fullPlan.length;
+      const body = fullPlan.slice(start + heading.length, end).trim().slice(0, 300);
+      return `${heading}\n${body}${body.length === 300 ? ' …' : ''}`;
+    }).join('\n\n');
+    planSample = condensed.length <= MAX_PLAN_CHARS
+      ? condensed
+      : condensed.slice(0, MAX_PLAN_CHARS) + '\n\n[... condensed plan truncated ...]';
+  }
+
+  const { detectedStack } = analysis;
+  const allDeps = {
+    ...detectedStack.dependencies,
+    ...detectedStack.devDependencies,
+  };
+  const depList = Object.entries(allDeps).slice(0, 30)
+    .map(([k, v]) => `${k}@${v}`).join(', ');
+
+  // Build env var inventory string for the coherence check
+  const envVarCheckContext = analysis.envVarInventory?.length
+    ? `\nENV VARS DISCOVERED IN SOURCE CODE (${analysis.envVarInventory.length} total — Section 10 must cover all of these):\n` +
+      analysis.envVarInventory.slice(0, 25).map((v) => `  ${v.name}`).join('\n') +
+      (analysis.envVarInventory.length > 25 ? `\n  ... and ${analysis.envVarInventory.length - 25} more` : '')
+    : '';
+
+  const prompt =
+`You are a senior software architect performing a quality-assurance review of a migration plan that was just auto-generated by an AI. Your job is to catch problems before the developer acts on the plan.
+
+REAL FILE TREE (these are the ONLY valid paths in this project):
+${realPaths}
+
+REAL DEPENDENCIES (these are the ONLY packages confirmed to exist):
+${depList || '(none detected)'}
+${envVarCheckContext}
+
+CURRENT STACK: ${detectedStack.primaryLanguage} ${detectedStack.currentVersion} / ${detectedStack.framework}
+MIGRATION TARGET: ${targetStack}
+
+GENERATED MIGRATION PLAN (review this for issues):
+${planSample}
+
+---
+
+Perform a strict coherence review. Output ONLY the following section — no preamble, no sign-off:
+
+## Plan Coherence Review
+
+### ❌ Invalid File Paths
+List every file path mentioned in the plan that does NOT appear in the real file tree above.
+Format each as: \`path/mentioned\` — found in **Section N**, not in project tree.
+If none: write "None found."
+
+### ⚠️ Cross-Section Contradictions
+List every case where two sections give conflicting instructions about the same file, command, or dependency.
+Format each as: **Section A** says [X] but **Section B** says [Y] — regarding [topic].
+If none: write "None found."
+
+### 🔢 Version Mismatches
+List every case where the plan references a package version that contradicts the real dependency list above, or where two sections cite different versions for the same package.
+Format each as: Plan mentions \`package@X.Y\` but real dep is \`package@A.B\` (Section N).
+If none: write "None found."
+
+### 🗂️ Unaddressed Files (High Priority Only)
+From the real file tree, identify up to 5 files that look critical to migration (entry points, config files, ORM models, route definitions, CI configs) but are NOT mentioned anywhere in the plan.
+Format each as: \`path/to/file\` — [why it likely needs migration attention].
+If none: write "None found."
+
+### 🔗 Cross-Section Link Gaps
+Check these specific cross-section connections — list any that are broken or missing:
+1. **Risk → Monitoring gap:** Do the risks listed in Section 2's risk register each have a corresponding alert rule in Section 14? List any Section 2 risk that has no monitoring counterpart in Section 14.
+2. **Env var coverage gap:** Are all env vars from the inventory above explicitly mentioned in Section 10's environment variable table? List any env vars that appear in the inventory but are absent from Section 10.
+3. **Dep change → Perf claim gap:** Does Section 6 introduce a dependency change that Section 12 claims a performance gain from? List any case where Section 12 mentions a gain from a dep that Section 6 does NOT actually upgrade or add.
+4. **Phase gates → Metrics gap:** Do the Phase 2 and Phase 3 Go/No-Go criteria in Section 16 reference specific metric thresholds (numbers) from Section 14? If any phase gate is vague (e.g., "verify performance" without a number), list it.
+If all links are intact: write "None found."
+
+### ✅ Summary
+One sentence: how many total issues were found across all categories and whether the plan is safe to act on as-is, or needs corrections first.`;
+
+  const fallbackPrompt =
+`Review this migration plan and list: (1) any file paths that don't exist in the real project, (2) contradictions between sections, (3) version mismatches against the real deps.
+
+Real file tree (first 100 paths):
+${safeTree.slice(0, 100).join('\n')}
+
+Real deps: ${depList}
+
+Plan (first 6000 chars):
+${fullPlan.slice(0, 6_000)}
+
+Output as: ## Plan Coherence Review with sub-headings for each issue type.`;
+
+  const minimalPrompt =
+`Briefly review this migration plan for contradictions and invented file names. Current stack: ${detectedStack.framework}. Target: ${targetStack}. Output as: ## Plan Coherence Review`;
+
+  await streamWithFallback(model, prompt, fallbackPrompt, minimalPrompt, onChunk, cancellationToken);
 }
 
 export async function getAvailableModels(): Promise<string[]> {

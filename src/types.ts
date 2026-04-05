@@ -24,6 +24,12 @@ export interface RedactionSummary {
   skippedFiles: string[];      // sensitive files that were not fetched at all
 }
 
+export interface EnvVarUsage {
+  name: string;          // e.g. "DATABASE_URL"
+  files: string[];       // source files that reference this var
+  defaultValue?: string; // inline default value if found (e.g. || '3000')
+}
+
 export interface DetectedStack {
   primaryLanguage: string;
   framework: string;
@@ -52,7 +58,10 @@ export interface RepoAnalysis {
   fileTree: string[];
   totalFiles: number;
   redactionSummary: RedactionSummary;
-  chunkSummaries?: ChunkSummary[]; // populated after full code analysis
+  chunkSummaries?: ChunkSummary[];     // populated after full code analysis
+  envVarInventory?: EnvVarUsage[];     // env vars discovered in source code
+  dependencyUsage?: Record<string, { usageCount: number; files: string[] }>; // actual import usage per dep
+  monorepoPackages?: string[];         // package names in monorepo (if applicable)
 }
 
 // ─── Webview <-> Extension Message Types ─────────────────────────────────────
@@ -85,7 +94,8 @@ export type WebviewMessageType =
   | 'chat'
   | 'clearChat'
   | 'applyStackChange'
-  | 'generateJiraStories';
+  | 'generateJiraStories'
+  | 'retrySection';
 
 export interface WebviewMessage {
   type: WebviewMessageType;
@@ -105,6 +115,7 @@ export interface WebviewMessage {
   chatMessage?: string;    // for chat
   jiraConfig?: JiraStoriesConfig; // for generateJiraStories
   regenerate?: boolean;    // for applyStackChange — true = regenerate full plan
+  sectionHeading?: string; // for retrySection
 }
 
 export interface AnalysisOptions {
@@ -216,7 +227,10 @@ export type ExtensionMessageType =
   | 'modelsLoaded'
   | 'jiraStoriesChunk'
   | 'jiraStoriesComplete'
-  | 'jiraStoriesCsv';
+  | 'jiraStoriesCsv'
+  | 'sectionProgress'
+  | 'coherenceReady'
+  | 'planDiff';
 
 export interface ExtensionMessage {
   type: ExtensionMessageType;
@@ -243,6 +257,12 @@ export interface ExtensionMessage {
   models?: string[];                        // for modelsLoaded
   jiraStories?: JiraStory[];                // for jiraStoriesComplete
   csvContent?: string;                      // for jiraStoriesCsv
+  sectionIndex?: number;                    // for sectionProgress — 0-based
+  sectionTotal?: number;                    // for sectionProgress — total count
+  sectionHeading?: string;                  // for sectionProgress / retrySection
+  failedSections?: string[];                // for planComplete — sections that failed
+  coherenceReview?: string;                 // for coherenceReady — isolated from _lastPlan
+  diffStats?: { added: number; removed: number; sections: string[] }; // for planDiff
 }
 
 // ─── AI Stack Detection ───────────────────────────────────────────────────────
