@@ -3575,6 +3575,9 @@ function stopGeneration(cancelled) {
   btnGenerate.disabled = false;
   btnStop.style.display = 'none';
   genIndicator.style.display = 'none';
+  // Cancel any pending scheduleRender timer — otherwise it can fire after the
+  // final renderPlanFull below and overwrite the last section with a streaming cursor.
+  flushRender('plan', function() {});
   if (cancelled && planMarkdown) {
     planMarkdown += '\\n\\n---\\n*Generation stopped.*';
     renderPlanFull();
@@ -4084,22 +4087,25 @@ function renderPlanIncremental(isFinal) {
   }
 }
 
-// Full re-render with syntax highlighting (called once at planComplete / planPatchComplete).
-// Processes one section per event-loop tick so highlight() NEVER blocks the browser thread.
+// Full re-render with syntax highlighting.
+// Synchronous + atomic: builds all section divs into a DocumentFragment off-DOM,
+// then swaps in one planRendered.innerHTML = '' + appendChild call so there is
+// never a blank-screen window.  highlight() has a built-in >4000 char fast-path
+// so cost per section is bounded; ~10-30 ms total for a typical plan.
 function renderPlanFull() {
-  _planFrozenCount = 0;
+  if (!planMarkdown) { return; }
+  var parts = splitPlanSections(planMarkdown);
+  var frag = document.createDocumentFragment();
+  for (var _rfi = 0; _rfi < parts.length; _rfi++) {
+    var _rfd = document.createElement('div');
+    _rfd.dataset.ps = String(_rfi);
+    _rfd.innerHTML = parseMarkdown(parts[_rfi]); // WITH highlighting — called once per section
+    frag.appendChild(_rfd);
+  }
+  // Atomic DOM swap — browser sees clear+populate as one paint operation
   planRendered.innerHTML = '';
-  var _rfParts = splitPlanSections(planMarkdown);
-  if (!_rfParts.length) { return; }
-  (function _rfStep(idx) {
-    if (idx >= _rfParts.length) { return; }
-    var div = document.createElement('div');
-    div.dataset.ps = String(idx);
-    planRendered.appendChild(div);
-    div.innerHTML = parseMarkdown(_rfParts[idx]); // WITH highlighting — safe, only once per section
-    _planFrozenCount = idx + 1;
-    setTimeout(function() { _rfStep(idx + 1); }, 0);
-  })(0);
+  planRendered.appendChild(frag);
+  _planFrozenCount = parts.length;
 }
 
 // ─── Table of Contents (TOC) ──────────────────────────────────────────────────
