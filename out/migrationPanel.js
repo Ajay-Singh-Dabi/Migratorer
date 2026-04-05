@@ -66,6 +66,7 @@ class MigrationPanel {
     constructor(panel, secrets, globalState) {
         this._disposables = [];
         this._lastPlan = '';
+        this._coherenceReview = ''; // isolated — excluded from exports, chat, Jira, history
         this._lastTargetStack = '';
         this._chatHistory = [];
         this._panel = panel;
@@ -308,17 +309,20 @@ class MigrationPanel {
                 });
             });
             // ── Coherence check: validate the completed plan for contradictions,
-            //    invented file paths, and version mismatches. Wrapped in try/catch
-            //    so a failure here never breaks the plan display.
+            //    invented file paths, and version mismatches.
+            //    The review is stored separately and NEVER merged into _lastPlan so
+            //    exports, Jira stories, chat context, and history all stay clean.
             if (!token.isCancellationRequested) {
                 try {
+                    let coherenceBuf = '';
                     const coherenceHeading = '\n\n---\n\n## Plan Coherence Review\n\n';
-                    this._lastPlan += coherenceHeading;
                     this._post({ type: 'planChunk', chunk: coherenceHeading });
                     await (0, copilotService_1.streamCoherenceCheck)(analysis, targetStack, this._lastPlan, (chunk) => {
-                        this._lastPlan += chunk;
+                        coherenceBuf += chunk;
                         this._post({ type: 'planChunk', chunk });
                     }, token);
+                    this._coherenceReview = coherenceBuf;
+                    this._post({ type: 'coherenceReady', coherenceReview: coherenceBuf });
                 }
                 catch {
                     // Coherence check is best-effort — silently skip on failure
@@ -791,8 +795,10 @@ class MigrationPanel {
         this._post({ type: 'planPatchChunk', chunk: '' });
         try {
             await (0, copilotService_1.streamPlanPatch)(this._lastAnalysis, this._lastPlan, intent, (chunk) => this._post({ type: 'planPatchChunk', chunk }), (patchedPlan) => {
+                const diff = this._diffStats(this._lastPlan, patchedPlan);
                 this._lastPlan = patchedPlan;
                 this._post({ type: 'planPatchComplete', patchedPlan });
+                this._post({ type: 'planDiff', diffStats: diff });
             }, token);
         }
         catch (err) {
@@ -836,10 +842,13 @@ class MigrationPanel {
                 const pattern = new RegExp(`(##+ \\d+\\.?[^\\n]*${escaped}[^\\n]*)([\\s\\S]*?)` +
                     `${failureMarker.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[^\\n]*\\n?`, 'i');
                 const patchedPlan = this._lastPlan.replace(pattern, `$1\n\n${retryContent}\n`);
+                const oldPlan = this._lastPlan;
                 this._lastPlan = patchedPlan !== this._lastPlan
                     ? patchedPlan
                     : this._lastPlan + `\n\n${retryContent}\n`; // fallback: append
+                const retryDiff = this._diffStats(oldPlan, this._lastPlan);
                 this._post({ type: 'planPatchComplete', patchedPlan: this._lastPlan });
+                this._post({ type: 'planDiff', diffStats: retryDiff });
             }
             else {
                 this._post({ type: 'error', message: `Could not regenerate section "${sectionHeading}". Try again later.` });
@@ -850,6 +859,33 @@ class MigrationPanel {
         }
     }
     // ─── Helpers ──────────────────────────────────────────────────────────────────
+    /** Line-level diff — returns +/- counts and list of changed section headings. */
+    _diffStats(before, after) {
+        const oldLines = new Set(before.split('\n'));
+        const newLines = after.split('\n');
+        let added = 0, removed = 0;
+        const changedSections = [];
+        let currentSection = '';
+        for (const line of newLines) {
+            const hm = line.match(/^#{1,3} .+/);
+            if (hm) {
+                currentSection = line.replace(/^#+\s*/, '').trim();
+            }
+            if (!oldLines.has(line)) {
+                added++;
+                if (currentSection && !changedSections.includes(currentSection)) {
+                    changedSections.push(currentSection);
+                }
+            }
+        }
+        const newLineSet = new Set(newLines);
+        for (const line of before.split('\n')) {
+            if (!newLineSet.has(line)) {
+                removed++;
+            }
+        }
+        return { added, removed, sections: changedSections };
+    }
     _post(msg) {
         this._panel.webview.postMessage(msg);
     }
@@ -1380,6 +1416,29 @@ class MigrationPanel {
   #plan-rendered strong { font-weight: 600; }
   #plan-rendered em { font-style: italic; }
   #plan-rendered hr { border: none; border-top: 1px solid var(--vscode-panel-border); margin: 16px 0; }
+
+  /* ── TOC panel ── */
+  #plan-toc { background: var(--vscode-sideBar-background); }
+  #plan-toc a {
+    display: block; padding: 3px 12px; font-size: 11px; text-decoration: none;
+    color: var(--vscode-descriptionForeground); border-left: 2px solid transparent;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  #plan-toc a:hover { color: var(--vscode-foreground); }
+  #plan-toc a.toc-active {
+    color: var(--vscode-foreground); border-left-color: var(--vscode-focusBorder);
+    background: var(--vscode-list-hoverBackground);
+  }
+  #plan-toc li.toc-h2 a { padding-left: 12px; }
+  #plan-toc li.toc-h3 a { padding-left: 24px; font-size: 10px; }
+
+  /* ── Streaming cursor ── */
+  @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0} }
+  .stream-cursor {
+    display: inline-block; width: 2px; height: 1em;
+    background: var(--vscode-foreground); margin-left: 2px;
+    vertical-align: text-bottom; animation: blink 1s step-start infinite;
+  }
 
   /* ── Code blocks (parseMarkdown output) ── */
   .code-wrap {
@@ -1980,9 +2039,19 @@ class MigrationPanel {
             </select>
             <button class="copy-btn" id="btn-jira-stories" title="Generate Jira stories for this migration" disabled>🎫 Jira Stories</button>
             <button class="copy-btn" id="btn-copy">Copy</button>
+            <button id="btn-toc-toggle" class="copy-btn" title="Toggle table of contents" style="display:none">☰ Contents</button>
           </div>
         </div>
-        <div id="plan-rendered" style="flex:1; overflow:auto"></div>
+        <div style="display:flex;flex:1;overflow:hidden">
+          <div id="plan-toc" style="display:none;width:200px;flex-shrink:0;overflow-y:auto;border-right:1px solid var(--vscode-panel-border);padding:10px 0">
+            <div style="padding:0 12px 6px;font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.04em;opacity:.6;display:flex;align-items:center;justify-content:space-between">
+              Contents
+              <button id="btn-toc-close" style="background:none;border:none;cursor:pointer;opacity:.5;font-size:12px;line-height:1;padding:0">✕</button>
+            </div>
+            <ul id="toc-list" style="list-style:none;padding:0;margin:0"></ul>
+          </div>
+          <div id="plan-rendered" style="flex:1;overflow:auto"></div>
+        </div>
       </div>
     </div>
 
@@ -2156,7 +2225,7 @@ class MigrationPanel {
           <button class="copy-btn" id="btn-close-export">✕ Close</button>
         </div>
       </div>
-      <pre id="export-content" style="flex:1;overflow:auto;white-space:pre-wrap;font-size:12px;background:var(--vscode-editor-background);border:1px solid var(--vscode-panel-border);border-radius:6px;padding:12px"></pre>
+      <div id="export-content" style="flex:1;overflow:auto;font-size:12px;background:var(--vscode-editor-background);border:1px solid var(--vscode-panel-border);border-radius:6px;padding:12px"></div>
     </div>
 
     <!-- Jira Stories Config Modal -->
@@ -2234,27 +2303,33 @@ let isGenerating = false;
 let lastRepoUrl   = '';
 
 // ─── Render Scheduler ─────────────────────────────────────────────────────────
-// Trailing-throttle: each call cancels the previous timer and schedules a new
-// one. Only the render after the LAST chunk in each burst actually fires.
-// Uses setTimeout (not requestAnimationFrame) so renders fire reliably even
-// when the VS Code panel is not the active view — rAF is throttled to ~1 fps
-// by Electron/Chromium for background webviews.
-const RENDER_INTERVAL_MS = 40;
-const _renderTimers = Object.create(null);
+// Throttle with leading + trailing fire.
+//
+// Problem with pure trailing debounce: the LLM streams chunks continuously,
+// so a "cancel + reschedule on every chunk" timer NEVER fires while streaming.
+//
+// This implementation fires immediately on the first chunk (leading), then at
+// most once per RENDER_INTERVAL_MS after that regardless of chunk rate. Each
+// fn() closes over shared state (planMarkdown etc.) so it always reads the
+// latest accumulated text when it executes.
+const RENDER_INTERVAL_MS = 500; // Increased from 150 — parse+innerHTML on a large plan is ~20ms; 500ms gives breathing room
+const _renderTimers  = Object.create(null); // key → setTimeout handle
+const _lastRenderAt  = Object.create(null); // key → timestamp of last render
 
 function scheduleRender(key, fn) {
-  if (_renderTimers[key]) { clearTimeout(_renderTimers[key]); }
+  if (_renderTimers[key]) { return; } // timer already queued; it will read fresh state when it fires
+  const elapsed = Date.now() - (_lastRenderAt[key] || 0);
+  const delay   = Math.max(0, RENDER_INTERVAL_MS - elapsed); // 0 = fire immediately (leading)
   _renderTimers[key] = setTimeout(() => {
     delete _renderTimers[key];
+    _lastRenderAt[key] = Date.now();
     fn();
-  }, RENDER_INTERVAL_MS);
+  }, delay);
 }
 
 function flushRender(key, fn) {
-  if (_renderTimers[key]) {
-    clearTimeout(_renderTimers[key]);
-    delete _renderTimers[key];
-  }
+  if (_renderTimers[key]) { clearTimeout(_renderTimers[key]); delete _renderTimers[key]; }
+  _lastRenderAt[key] = Date.now();
   fn();
 }
 
@@ -2301,6 +2376,9 @@ const stackAiLoading   = document.getElementById('stack-ai-loading');
 const planEmpty        = document.getElementById('plan-empty');
 const planContainer    = document.getElementById('plan-container');
 const planRendered     = document.getElementById('plan-rendered');
+      const planToc          = document.getElementById('plan-toc');
+      const tocList          = document.getElementById('toc-list');
+      const btnTocToggle     = document.getElementById('btn-toc-toggle');
 const planOutput       = document.getElementById('plan-output');
 const filesEmpty       = document.getElementById('files-empty');
 const filesContainer   = document.getElementById('files-container');
@@ -2545,6 +2623,19 @@ btnValidateToken.addEventListener('click', () => {
   vscode.postMessage({ type: 'validateToken', githubToken: tok, repoUrl: inputRepo.value.trim() || undefined });
 });
 
+// ─── TOC toggle / close ─────────────────────────────────────────────────────
+btnTocToggle.addEventListener('click', () => {
+  var open = planToc.style.display !== 'none';
+  planToc.style.display = open ? 'none' : 'block';
+  btnTocToggle.style.background = open ? '' : 'var(--vscode-button-secondaryBackground)';
+  if (open) { planToc.dataset.userClosed = '1'; } else { delete planToc.dataset.userClosed; }
+});
+document.getElementById('btn-toc-close').addEventListener('click', () => {
+  planToc.style.display = 'none';
+  planToc.dataset.userClosed = '1';
+  btnTocToggle.style.background = '';
+});
+
 // ─── Save as .md (enhancement #2) ─────────────────────────────────────────────
 btnSaveMd.addEventListener('click', () => {
   vscode.postMessage({ type: 'savePlan', plan: planMarkdown });
@@ -2682,7 +2773,7 @@ exportFormat.addEventListener('change', () => {
     exportMarkdown = '';
     exportOutputWrap.style.display = 'flex';
     exportTitle.textContent = '📊 Executive Summary';
-    exportContent.textContent = 'Generating…';
+    exportContent.innerHTML = '<em style="opacity:0.5">Generating…</em>';
     vscode.postMessage({ type: 'exportPlan', exportFormat: fmt });
     return;
   }
@@ -2690,7 +2781,7 @@ exportFormat.addEventListener('change', () => {
   exportOutputWrap.style.display = 'flex';
   const labels = { checklist: '✅ Checklist', 'github-issue': '🐙 GitHub Issue', confluence: '📝 Confluence' };
   exportTitle.textContent = labels[fmt] || 'Export';
-  exportContent.textContent = 'Generating…';
+  exportContent.innerHTML = '<em style="opacity:0.5">Generating…</em>';
   vscode.postMessage({ type: 'exportPlan', exportFormat: fmt });
 });
 
@@ -2891,24 +2982,30 @@ window.addEventListener('message', (event) => {
       if (msg.chunk === '') {
         flushRender('plan', () => {});
         planMarkdown = '';
-        planRendered.innerHTML = '';
+        clearPlanDOM();
         planOutput.textContent = '';
         showPlanContainer();
       } else {
         planMarkdown += msg.chunk;
         rawEmpty.style.display = 'none';
         planOutput.style.display = 'block';
+        // Incremental render: only the tail section is re-parsed each tick.
+        // All previously completed sections stay frozen in the DOM.
         scheduleRender('plan', () => {
-          planRendered.innerHTML = parseMarkdown(planMarkdown);
+          renderPlanIncremental(false);
           planOutput.textContent = planMarkdown;
-          planRendered.scrollTop = planRendered.scrollHeight;
+          if (planRendered.scrollHeight - planRendered.scrollTop - planRendered.clientHeight < 200) {
+            planRendered.scrollTop = planRendered.scrollHeight;
+          }
         });
       }
       break;
 
     case 'planComplete':
       flushRender('plan', () => {
-        planRendered.innerHTML = parseMarkdown(planMarkdown);
+        // Full re-render with highlighting now that streaming is done.
+        // Sections were frozen during streaming without highlight to avoid blocking.
+        renderPlanFull();
         planOutput.textContent = planMarkdown;
       });
       stopGeneration(false);
@@ -2951,13 +3048,88 @@ window.addEventListener('message', (event) => {
         banner.appendChild(dismiss);
         planRendered.insertBefore(banner, planRendered.firstChild);
       }
+      buildToc(planMarkdown);
       break;
 
+    case 'coherenceReady': {
+      // Append coherence review as a separate DOM block — never touches planMarkdown
+      // so exports, Jira, chat context and history all stay clean
+      if (msg.coherenceReview) {
+        const sep = document.createElement('hr');
+        sep.style.cssText = 'margin:20px 0;border:none;border-top:1px solid var(--vscode-panel-border)';
+        planRendered.appendChild(sep);
+        const reviewDiv = document.createElement('div');
+        reviewDiv.id = 'coherence-review';
+        reviewDiv.innerHTML = parseMarkdown(msg.coherenceReview);
+        planRendered.appendChild(reviewDiv);
+        // Add a TOC entry for the coherence review section
+        if (tocList) {
+          const li = document.createElement('li');
+          li.style.cssText = 'margin-top:6px;border-top:1px solid var(--vscode-panel-border);padding-top:6px';
+          const a = document.createElement('a');
+          a.textContent = '\uD83D\uDCCB Coherence Review';
+          a.style.cssText = 'font-size:10px;font-style:italic;opacity:0.8';
+          a.href = '#';
+          a.addEventListener('click', (e) => {
+            e.preventDefault();
+            reviewDiv.scrollIntoView({ behavior: 'smooth', block: 'start' });
+          });
+          li.appendChild(a);
+          tocList.appendChild(li);
+        }
+      }
+      break;
+    }
+
+    case 'planDiff': {
+      // Show an inline diff badge in the plan header after any patch or retry
+      const stats = msg.diffStats;
+      if (!stats) { break; }
+      const existing = document.getElementById('plan-diff-badge');
+      if (existing) { existing.remove(); }
+      const badge = document.createElement('div');
+      badge.id = 'plan-diff-badge';
+      badge.style.cssText = [
+        'display:inline-flex', 'gap:6px', 'align-items:center',
+        'padding:3px 10px', 'border-radius:12px', 'font-size:11px',
+        'background:var(--vscode-diffEditor-insertedLineBackground,rgba(0,180,0,0.07))',
+        'border:1px solid var(--vscode-diffEditor-insertedTextBorder,rgba(0,180,0,0.3))',
+        'margin-left:8px', 'vertical-align:middle',
+      ].join(';');
+      const addSpan = document.createElement('span');
+      addSpan.style.color = 'var(--vscode-gitDecoration-addedResourceForeground,#81c784)';
+      addSpan.textContent = '+' + stats.added;
+      const remSpan = document.createElement('span');
+      remSpan.style.color = 'var(--vscode-gitDecoration-deletedResourceForeground,#e57373)';
+      remSpan.textContent = '-' + stats.removed;
+      badge.appendChild(addSpan);
+      badge.appendChild(remSpan);
+      if (stats.sections && stats.sections.length > 0) {
+        const secSpan = document.createElement('span');
+        secSpan.style.cssText = 'opacity:0.7;max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap';
+        secSpan.title = stats.sections.join(', ');
+        secSpan.textContent = stats.sections.length === 1
+          ? stats.sections[0].slice(0, 30)
+          : stats.sections.length + ' sections changed';
+        badge.appendChild(secSpan);
+      }
+      const closeBtn = document.createElement('button');
+      closeBtn.textContent = '\u2715';
+      closeBtn.style.cssText = 'background:none;border:none;cursor:pointer;opacity:0.5;font-size:10px;padding:0 2px';
+      closeBtn.addEventListener('click', () => badge.remove());
+      badge.appendChild(closeBtn);
+      const planHeader = document.querySelector('.plan-header');
+      if (planHeader) { planHeader.appendChild(badge); }
+      buildToc(planMarkdown);
+      break;
+    }
+
     case 'sectionProgress': {
-      // Update the progress bar to reflect which section is being generated
+      // Update the progress bar only — the throttled scheduleRender in planChunk
+      // already keeps the formatted view up to date at the right pace
       const idx   = (msg.sectionIndex ?? 0) + 1;
       const total = msg.sectionTotal ?? 1;
-      const pct   = Math.round((idx / total) * 90); // cap at 90% — planComplete fills the rest
+      const pct   = Math.round((idx / total) * 90);
       progressBar.style.width = pct + '%';
       const shortHeading = (msg.sectionHeading ?? '').replace(/^##+ ?\d+\.?\s*/, '');
       progressText.textContent = \`Generating section \${idx} of \${total}: \${shortHeading}\`;
@@ -3040,13 +3212,15 @@ window.addEventListener('message', (event) => {
     // Export (enhancement #4)
     case 'exportReady':
       exportMarkdown = msg.exportContent || '';
-      exportContent.textContent = exportMarkdown || 'Generating…';
+      exportContent.innerHTML = exportMarkdown
+        ? parseMarkdown(exportMarkdown)
+        : '<em style="opacity:0.5">Generating…</em>';
       break;
 
     // Exec Summary (enhancement #5)
     case 'execSummaryChunk':
-      if (msg.chunk === '') { exportMarkdown = ''; exportContent.textContent = ''; }
-      else { exportMarkdown += msg.chunk; exportContent.textContent = exportMarkdown; }
+      if (msg.chunk === '') { exportMarkdown = ''; exportContent.innerHTML = ''; }
+      else { exportMarkdown += msg.chunk; scheduleRender('export', function() { exportContent.innerHTML = parseMarkdown(exportMarkdown); }); }
       break;
     case 'execSummaryComplete':
       break;
@@ -3206,14 +3380,16 @@ window.addEventListener('message', (event) => {
     // Plan is being rewritten section-by-section
     case 'planPatchChunk':
       if (msg.chunk === '') {
-        // Empty chunk = patch starting. Keep the old plan visible; it will
-        // be replaced section-by-section so the tab never goes fully blank.
+        // Empty chunk = patch starting.
         flushRender('plan', () => {});
         planMarkdown = '';
+        clearPlanDOM(); // must clear DOM + counter together; resetting only the counter
+        // left stale div[data-ps=N] elements that caused ALL sections to be re-frozen
+        // (re-parsing and re-highlighting) on every 500ms tick during a patch.
       } else {
         planMarkdown += msg.chunk;
         scheduleRender('plan', () => {
-          planRendered.innerHTML = parseMarkdown(planMarkdown);
+          renderPlanIncremental(false);
           planOutput.textContent = planMarkdown;
           planRendered.scrollTop = planRendered.scrollHeight;
         });
@@ -3226,10 +3402,10 @@ window.addEventListener('message', (event) => {
       planPatchIndicator.style.display = 'none';
       if (msg.patchedPlan) {
         planMarkdown = msg.patchedPlan;
-        planRendered.innerHTML = parseMarkdown(planMarkdown);
+        renderPlanFull();
         planOutput.textContent = planMarkdown;
       } else {
-        planRendered.innerHTML = parseMarkdown(planMarkdown);
+        renderPlanFull();
         planOutput.textContent = planMarkdown;
       }
       // Append a confirmation bubble so the user knows the plan was updated
@@ -3243,6 +3419,7 @@ window.addEventListener('message', (event) => {
       note.appendChild(noteBubble);
       chatThread.appendChild(note);
       chatThread.scrollTop = chatThread.scrollHeight;
+      buildToc(planMarkdown);
       break;
     }
   }
@@ -3400,7 +3577,7 @@ function stopGeneration(cancelled) {
   genIndicator.style.display = 'none';
   if (cancelled && planMarkdown) {
     planMarkdown += '\\n\\n---\\n*Generation stopped.*';
-    planRendered.innerHTML = parseMarkdown(planMarkdown);
+    renderPlanFull();
   }
 }
 
@@ -3591,6 +3768,9 @@ function escapeHtml(s) {
 // ─── Syntax Highlighter ────────────────────────────────────────────────────────
 function highlight(code, lang) {
   function he(s) { return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+  // Skip syntax highlighting for large blocks — the char-by-char loop would
+  // block the browser thread and freeze rendering while the plan is streaming.
+  if (code.length > 4000) { return he(code); }
   var KW = {
     python:     'False None True and as assert async await break class continue def del elif else except finally for from global if import in is lambda nonlocal not or pass raise return try while with yield',
     javascript: 'async await break case catch class const continue default delete do else export extends finally for from function if import in instanceof let new of return static super switch throw try typeof var void while yield true false null undefined this',
@@ -3674,7 +3854,10 @@ function copyCode(btn) {
 }
 
 // ─── Line-by-line Markdown Parser ────────────────────────────────────────────
-function parseMarkdown(md) {
+// noHighlight=true: skip syntax highlighting (used for the streaming tail so
+// highlight() is never called repeatedly on every 500 ms render tick — it is
+// only called once when a section is frozen into the DOM).
+function parseMarkdown(md, noHighlight) {
   var lines = md.split('\\n');
   var out = [];
   var i = 0;
@@ -3714,12 +3897,22 @@ function parseMarkdown(md) {
       var lang = line.replace(/^\`\`\`/, '').trim() || 'code';
       var codeAcc = [];
       i++;
-      while (i < lines.length && !/^\`\`\`/.test(lines[i])) { codeAcc.push(lines[i]); i++; }
-      i++; // closing fence
+      var closingFound = false;
+      while (i < lines.length) {
+        if (/^\`\`\`\s*$/.test(lines[i])) { closingFound = true; i++; break; }
+        codeAcc.push(lines[i]); i++;
+      }
+      var codeBody = codeAcc.join('\\n');
+      // Only highlight when the block is closed AND we are not in the streaming
+      // tail pass (noHighlight=true). This ensures highlight() is called at most
+      // once per code block — when the section is frozen — never on every tick.
+      var codeHtml = (closingFound && !noHighlight) ? highlight(codeBody, lang) : esc(codeBody);
       out.push(
         '<div class="code-wrap">' +
-        '<div class="code-label">' + esc(lang) + '<button class="code-copy-btn" onclick="copyCode(this)">Copy</button></div>' +
-        '<pre><code>' + highlight(codeAcc.join('\\n'), lang) + '</code></pre>' +
+        '<div class="code-label">' + esc(lang) +
+        (closingFound ? '<button class="code-copy-btn" onclick="copyCode(this)">Copy</button>' : '<span style="opacity:0.5;font-size:10px;margin-left:auto">streaming…</span>') +
+        '</div>' +
+        '<pre><code>' + codeHtml + '</code></pre>' +
         '</div>'
       );
       continue;
@@ -3812,10 +4005,154 @@ function parseMarkdown(md) {
       pLines.push(inline(esc(lines[i]))); i++;
     }
     if (pLines.length) { out.push('<p>' + pLines.join('<br>') + '</p>'); }
+    else { i++; } // safety: isBlockLine matched but no if-branch handled it (e.g. 7+ # heading) — advance to prevent infinite loop
   }
 
   flushList();
   return out.join('\\n');
+}
+
+// ─── Incremental Plan Renderer ───────────────────────────────────────────────
+// Instead of re-running parseMarkdown on the ENTIRE plan on every render tick
+// (O(n) and gets slower as the plan grows), we split by ## section headings and
+// keep completed sections frozen in DOM divs.  Only the LAST (still-streaming)
+// section is re-parsed each tick, keeping each render bounded to ~1–3 KB.
+var _planFrozenCount = 0; // sections whose divs are finalized and won't be touched
+
+/** Split planMarkdown into sections at top-level ## headings only.
+ *  Lines inside fenced code blocks are never treated as headings,
+ *  which was the root cause of the rendering freeze on code blocks. */
+function splitPlanSections(md) {
+  var lines = md.split('\\n');
+  var sections = [];
+  var current = [];
+  var inFence = false;
+  for (var i = 0; i < lines.length; i++) {
+    var line = lines[i];
+    // Toggle fence state on opening/closing triple-backtick lines
+    if (/^\`\`\`/.test(line)) { inFence = !inFence; }
+    // Start a new section at every ## heading that is NOT inside a code fence
+    if (!inFence && /^## /.test(line) && current.length > 0) {
+      sections.push(current.join('\\n'));
+      current = [];
+    }
+    current.push(line);
+  }
+  if (current.length > 0) { sections.push(current.join('\\n')); }
+  return sections.length > 0 ? sections : [md];
+}
+
+function clearPlanDOM() {
+  planRendered.innerHTML = '';
+  _planFrozenCount = 0;
+}
+
+function renderPlanIncremental(isFinal) {
+  if (!planMarkdown) { planRendered.innerHTML = ''; return; }
+  var parts = splitPlanSections(planMarkdown);
+
+  // How many sections to freeze on this call.
+  // During streaming: freeze all except the last (still being written).
+  // On final render: freeze everything.
+  var freezeUpTo = isFinal ? parts.length : Math.max(parts.length - 1, 0);
+
+  for (var s = _planFrozenCount; s < freezeUpTo; s++) {
+    var div = planRendered.querySelector('div[data-ps="' + s + '"]');
+    if (!div) {
+      div = document.createElement('div');
+      div.dataset.ps = String(s);
+      planRendered.appendChild(div);
+    }
+    // Always skip highlight() here — renderPlanFull() applies it once at completion.
+    // Calling highlight() on every section freeze caused up to 500ms UI blocks.
+    div.innerHTML = parseMarkdown(parts[s], true);
+    _planFrozenCount = s + 1;
+  }
+
+  if (!isFinal) {
+    // Re-render only the currently-streaming tail section
+    var lastIdx = parts.length - 1;
+    var lastDiv = planRendered.querySelector('div[data-ps="' + lastIdx + '"]');
+    if (!lastDiv) {
+      lastDiv = document.createElement('div');
+      lastDiv.dataset.ps = String(lastIdx);
+      planRendered.appendChild(lastDiv);
+    }
+    // Pass noHighlight=true: the tail section re-renders every 500 ms while
+    // streaming, so we must never call highlight() here — only on frozen divs.
+    lastDiv.innerHTML = parseMarkdown(parts[lastIdx], true) + '<span class="stream-cursor"></span>';
+  }
+}
+
+// Full re-render with syntax highlighting (called once at planComplete / planPatchComplete).
+// Processes one section per event-loop tick so highlight() NEVER blocks the browser thread.
+function renderPlanFull() {
+  _planFrozenCount = 0;
+  planRendered.innerHTML = '';
+  var _rfParts = splitPlanSections(planMarkdown);
+  if (!_rfParts.length) { return; }
+  (function _rfStep(idx) {
+    if (idx >= _rfParts.length) { return; }
+    var div = document.createElement('div');
+    div.dataset.ps = String(idx);
+    planRendered.appendChild(div);
+    div.innerHTML = parseMarkdown(_rfParts[idx]); // WITH highlighting — safe, only once per section
+    _planFrozenCount = idx + 1;
+    setTimeout(function() { _rfStep(idx + 1); }, 0);
+  })(0);
+}
+
+// ─── Table of Contents (TOC) ──────────────────────────────────────────────────
+// Throttled build: fires at most once per 800 ms while streaming
+var _tocThrottle = null;
+function buildToc(md) {
+  if (_tocThrottle) { return; }
+  _tocThrottle = setTimeout(function() { _tocThrottle = null; _buildTocNow(md); }, 800);
+}
+function _buildTocNow(md) {
+  if (!tocList) { return; }
+  var lines = md.split('\\n');
+  var headings = [];
+  for (var li = 0; li < lines.length; li++) {
+    var hm = lines[li].match(/^(#{1,3}) (.+)/);
+    if (hm) { headings.push({ level: hm[1].length, text: hm[2].replace(/\\*\\*/g, '').trim() }); }
+  }
+  if (headings.length < 2) {
+    if (planToc) { planToc.style.display = 'none'; }
+    if (btnTocToggle) { btnTocToggle.style.display = 'none'; }
+    return;
+  }
+  tocList.innerHTML = '';
+  headings.forEach(function(h) {
+    var li = document.createElement('li');
+    li.className = 'toc-h' + h.level;
+    var a = document.createElement('a');
+    a.textContent = h.text.replace(/^\\d+\\.\\s*/, '');
+    a.href = '#';
+    a.addEventListener('click', function(hCopy) {
+      return function(e) {
+        e.preventDefault();
+        var all = planRendered.querySelectorAll('h1,h2,h3');
+        var needle = hCopy.text.slice(0, 40).toLowerCase();
+        for (var j = 0; j < all.length; j++) {
+          if (all[j].textContent.trim().toLowerCase().startsWith(needle.slice(0, 20))) {
+            all[j].scrollIntoView({ behavior: 'smooth', block: 'start' });
+            tocList.querySelectorAll('a').forEach(function(x) { x.classList.remove('toc-active'); });
+            a.classList.add('toc-active');
+            break;
+          }
+        }
+      };
+    }(h));
+    li.appendChild(a);
+    tocList.appendChild(li);
+  });
+  btnTocToggle.style.display = 'inline-flex';
+  // Auto-open the first time enough headings appear, unless user closed it
+  if (headings.length >= 3 && planToc.style.display === 'none' && !planToc.dataset.userClosed) {
+    planToc.style.display = 'block';
+    btnTocToggle.style.background = 'var(--vscode-button-secondaryBackground)';
+  }
 }
 
 // ─── Init ─────────────────────────────────────────────────────────────────────
