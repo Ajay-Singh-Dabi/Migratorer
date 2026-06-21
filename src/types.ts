@@ -62,6 +62,7 @@ export interface RepoAnalysis {
   envVarInventory?: EnvVarUsage[];     // env vars discovered in source code
   dependencyUsage?: Record<string, { usageCount: number; files: string[] }>; // actual import usage per dep
   monorepoPackages?: string[];         // package names in monorepo (if applicable)
+  subRepos?: string[];                 // top-level repo names when several repos are analyzed as one project
 }
 
 // ─── Webview <-> Extension Message Types ─────────────────────────────────────
@@ -95,7 +96,17 @@ export type WebviewMessageType =
   | 'clearChat'
   | 'applyStackChange'
   | 'generateJiraStories'
-  | 'retrySection';
+  | 'retrySection'
+  | 'generateArchitecture'
+  | 'saveArchitecture'
+  | 'generateSecurity'
+  | 'saveSecurity'
+  | 'browseLocalFolder'
+  | 'analyzeLocal'
+  | 'analyzeLocalMulti'
+  | 'generateCorrection'
+  | 'saveCorrection'
+  | 'applyCorrection';
 
 export interface WebviewMessage {
   type: WebviewMessageType;
@@ -116,6 +127,16 @@ export interface WebviewMessage {
   jiraConfig?: JiraStoriesConfig; // for generateJiraStories
   regenerate?: boolean;    // for applyStackChange — true = regenerate full plan
   sectionHeading?: string; // for retrySection
+  localPath?: string;      // for analyzeLocal — absolute path of a local repo folder
+  localPaths?: string[];   // for analyzeLocalMulti — multiple repos analyzed as one project
+  scopeRepo?: string;      // for generateCorrection — focus on one sub-repo, or undefined = whole project
+}
+
+/** A local folder that looks like a code repository. */
+export interface LocalRepoCandidate {
+  name: string;   // display name (folder name)
+  path: string;   // absolute filesystem path
+  marker: string; // what made it look like a repo, e.g. "package.json", ".git"
 }
 
 export interface AnalysisOptions {
@@ -230,7 +251,42 @@ export type ExtensionMessageType =
   | 'jiraStoriesCsv'
   | 'sectionProgress'
   | 'coherenceReady'
-  | 'planDiff';
+  | 'planDiff'
+  | 'teamFormed'
+  | 'agentMessageStart'
+  | 'agentMessageChunk'
+  | 'agentMessageEnd'
+  | 'archTeamFormed'
+  | 'archAgentMessageStart'
+  | 'archAgentMessageChunk'
+  | 'archAgentMessageEnd'
+  | 'archChunk'
+  | 'archSectionProgress'
+  | 'archComplete'
+  | 'archError'
+  | 'architectureSaved'
+  | 'secTeamFormed'
+  | 'secAgentMessageStart'
+  | 'secAgentMessageChunk'
+  | 'secAgentMessageEnd'
+  | 'secChunk'
+  | 'secSectionProgress'
+  | 'secComplete'
+  | 'secError'
+  | 'securitySaved'
+  | 'localReposFound'
+  | 'corrTeamFormed'
+  | 'corrAgentMessageStart'
+  | 'corrAgentMessageChunk'
+  | 'corrAgentMessageEnd'
+  | 'corrChunk'
+  | 'corrSectionProgress'
+  | 'corrComplete'
+  | 'corrError'
+  | 'correctionSaved'
+  | 'applyProgress'
+  | 'applyComplete'
+  | 'applyError';
 
 export interface ExtensionMessage {
   type: ExtensionMessageType;
@@ -263,6 +319,27 @@ export interface ExtensionMessage {
   failedSections?: string[];                // for planComplete — sections that failed
   coherenceReview?: string;                 // for coherenceReady — isolated from _lastPlan
   diffStats?: { added: number; removed: number; sections: string[] }; // for planDiff
+  agents?: TeamAgent[];     // for teamFormed — the assembled migration team
+  agentId?: string;         // for agentMessage* — which agent is speaking
+  agentRole?: string;       // for agentMessageStart — display name
+  agentEmoji?: string;      // for agentMessageStart — avatar
+  agentPhase?: string;      // for agentMessageStart — 'analysis' | 'discussion' | 'synthesis'
+  localRoot?: string;       // for localReposFound — the browsed parent folder
+  localRepos?: LocalRepoCandidate[]; // for localReposFound — detected repo folders
+  appliedFiles?: string[];  // for applyComplete — files that were rewritten
+  backupPaths?: string[];   // for applyComplete — where backups were saved
+  canApply?: boolean;       // for analysisComplete — whether code-apply is available (local only)
+}
+
+// ─── Agent Team (multi-agent plan generation) ─────────────────────────────────
+
+/** A specialist agent on the simulated migration team. */
+export interface TeamAgent {
+  id: string;        // stable id used to route streamed messages, e.g. "frontend"
+  role: string;      // display name, e.g. "React Specialist"
+  emoji: string;     // single emoji avatar
+  focus: string;     // one-line description of the agent's domain
+  files: string[];   // repo files this agent "owns" (assigned from the file tree)
 }
 
 // ─── AI Stack Detection ───────────────────────────────────────────────────────

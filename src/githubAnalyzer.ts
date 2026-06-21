@@ -1,4 +1,6 @@
 import * as vscode from 'vscode';
+import * as fs from 'fs';
+import * as nodePath from 'path';
 import {
   RepoInfo,
   KeyFile,
@@ -6,6 +8,7 @@ import {
   RepoAnalysis,
   RedactionSummary,
   EnvVarUsage,
+  LocalRepoCandidate,
 } from './types';
 
 // ─── Secret Redaction ─────────────────────────────────────────────────────────
@@ -953,6 +956,388 @@ export async function analyzeRepository(
     fileTree,
     totalFiles: fileTree.length,
     redactionSummary,
+    ...(envVarInventory.length > 0 ? { envVarInventory } : {}),
+    ...(Object.keys(dependencyUsage).length > 0 ? { dependencyUsage } : {}),
+    ...(monorepoPackages.length > 0 ? { monorepoPackages } : {}),
+  };
+}
+
+// ─── Local Folder Analyzer ────────────────────────────────────────────────────
+
+// Filenames that mark a directory as a code repository.
+const REPO_MARKER_FILES = [
+  'package.json', 'pom.xml', 'build.gradle', 'build.gradle.kts',
+  'go.mod', 'Cargo.toml', 'requirements.txt', 'pyproject.toml', 'setup.py',
+  'Pipfile', 'composer.json', 'Gemfile', 'global.json',
+  'pnpm-workspace.yaml', 'lerna.json', 'nx.json', 'turbo.json',
+];
+
+/** Returns the marker that makes a directory look like a repo, or null. */
+function detectRepoMarker(dirFsPath: string): string | null {
+  try {
+    if (fs.existsSync(nodePath.join(dirFsPath, '.git'))) { return '.git'; }
+  } catch { /* ignore */ }
+  for (const marker of REPO_MARKER_FILES) {
+    try { if (fs.existsSync(nodePath.join(dirFsPath, marker))) { return marker; } } catch { /* ignore */ }
+  }
+  // .NET solutions/projects live as *.sln / *.csproj at the root
+  try {
+    const entries = fs.readdirSync(dirFsPath);
+    const proj = entries.find((e) => e.endsWith('.sln') || e.endsWith('.csproj'));
+    if (proj) { return proj; }
+  } catch { /* ignore */ }
+  return null;
+}
+
+/**
+ * Scans a chosen parent folder for code repositories: the immediate
+ * subdirectories that look like repos, plus the folder itself if it is one.
+ */
+export async function scanLocalFolder(rootFsPath: string): Promise<{ root: string; repos: LocalRepoCandidate[] }> {
+  const repos: LocalRepoCandidate[] = [];
+
+  // The chosen folder may itself be a single repo
+  const rootMarker = detectRepoMarker(rootFsPath);
+  if (rootMarker) {
+    repos.push({ name: `${nodePath.basename(rootFsPath)} (this folder)`, path: rootFsPath, marker: rootMarker });
+  }
+
+  // Immediate subdirectories that look like repos
+  let entries: fs.Dirent[] = [];
+  try { entries = fs.readdirSync(rootFsPath, { withFileTypes: true }); } catch { /* ignore */ }
+  for (const e of entries) {
+    if (!e.isDirectory()) { continue; }
+    if (e.name.startsWith('.') || SKIP_SAMPLE_DIRS.has(e.name)) { continue; }
+    const sub = nodePath.join(rootFsPath, e.name);
+    const marker = detectRepoMarker(sub);
+    if (marker) { repos.push({ name: e.name, path: sub, marker }); }
+  }
+
+  repos.sort((a, b) => a.name.localeCompare(b.name));
+  return { root: rootFsPath, repos };
+}
+
+/** Recursively collect repo-relative file paths (forward-slashed), bounded. */
+function walkLocalTree(rootFsPath: string, maxFiles = 20000): string[] {
+  const out: string[] = [];
+  const stack: string[] = [''];
+  while (stack.length > 0 && out.length < maxFiles) {
+    const rel = stack.pop()!;
+    const abs = rel ? nodePath.join(rootFsPath, rel) : rootFsPath;
+    let entries: fs.Dirent[];
+    try { entries = fs.readdirSync(abs, { withFileTypes: true }); } catch { continue; }
+    for (const e of entries) {
+      const childRel = rel ? `${rel}/${e.name}` : e.name;
+      if (e.isDirectory()) {
+        if (e.name === '.git' || SKIP_SAMPLE_DIRS.has(e.name)) { continue; }
+        stack.push(childRel);
+      } else if (e.isFile()) {
+        out.push(childRel);
+        if (out.length >= maxFiles) { break; }
+      }
+    }
+  }
+  return out;
+}
+
+function readLocalFile(rootFsPath: string, relPath: string): string | null {
+  try {
+    const abs = nodePath.join(rootFsPath, relPath);
+    const stat = fs.statSync(abs);
+    if (stat.size > 2_000_000) { return null; } // skip very large files (likely not source)
+    return fs.readFileSync(abs, 'utf-8');
+  } catch {
+    return null;
+  }
+}
+
+function readLocalDefaultBranch(rootFsPath: string): string {
+  try {
+    const head = fs.readFileSync(nodePath.join(rootFsPath, '.git', 'HEAD'), 'utf-8').trim();
+    const m = head.match(/ref:\s*refs\/heads\/(.+)$/);
+    if (m) { return m[1]; }
+  } catch { /* ignore */ }
+  return 'main';
+}
+
+/** Read a file's FULL content from a local repo (skips files > 2 MB). */
+export function readRepoFileFull(rootFsPath: string, relPath: string): string | null {
+  return readLocalFile(rootFsPath, relPath);
+}
+
+/** Overwrite a file in a local repo with new content. */
+export function writeRepoFile(rootFsPath: string, relPath: string, content: string): void {
+  fs.writeFileSync(nodePath.join(rootFsPath, relPath), content, 'utf-8');
+}
+
+/**
+ * Copy a repo folder to a timestamped sibling backup before any edits.
+ * Excludes node_modules/.git and build output to keep it fast and small.
+ * Returns the absolute backup path.
+ */
+export async function backupRepoFolder(rootFsPath: string): Promise<string> {
+  const parent = nodePath.dirname(rootFsPath);
+  const base = nodePath.basename(rootFsPath);
+  const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+  const dest = nodePath.join(parent, `${base}-backup-${ts}`);
+  const SKIP = new Set([...SKIP_SAMPLE_DIRS, '.git']);
+  fs.cpSync(rootFsPath, dest, {
+    recursive: true,
+    filter: (src) => !SKIP.has(nodePath.basename(src)),
+  });
+  return dest;
+}
+
+/**
+ * Analyze a repository that lives on the local filesystem. Produces the same
+ * RepoAnalysis shape as analyzeRepository so every downstream feature (plan,
+ * architecture, security) works identically — but reads from disk, not GitHub.
+ */
+export async function analyzeLocalRepository(
+  rootFsPath: string,
+  onProgress: (msg: string, step: number, total: number) => void,
+  maxSourceFiles = 80
+): Promise<RepoAnalysis> {
+  const STEPS = 4;
+  const repoName = nodePath.basename(rootFsPath);
+  const parentName = nodePath.basename(nodePath.dirname(rootFsPath)) || 'local';
+
+  onProgress(`Scanning ${repoName}…`, 1, STEPS);
+  const fileTree = walkLocalTree(rootFsPath);
+
+  // ── .migrationignore support (read from disk) ───────────────────────────────
+  const migrationIgnoreRaw = readLocalFile(rootFsPath, '.migrationignore');
+  const ignoreRules = migrationIgnoreRaw ? parseMigrationIgnore(migrationIgnoreRaw) : [];
+
+  onProgress('Detecting config and source files…', 2, STEPS);
+
+  const existingKeyFiles = KEY_FILE_PATTERNS.filter(
+    (kf) => fileTree.includes(kf.path) && !isIgnoredByMigrationIgnore(kf.path, ignoreRules)
+  );
+  const ciWorkflows = fileTree.filter((f) =>
+    f.startsWith('.github/workflows/') && (f.endsWith('.yml') || f.endsWith('.yaml')) && !isIgnoredByMigrationIgnore(f, ignoreRules)
+  ).slice(0, 5);
+  const csprojFiles = fileTree
+    .filter((f) => f.endsWith('.csproj') && !isIgnoredByMigrationIgnore(f, ignoreRules)
+      && !existingKeyFiles.some((kf) => kf.path === f))
+    .slice(0, 3)
+    .map((p) => ({ path: p, type: 'build-tool' as KeyFile['type'] }));
+
+  const configPaths = new Set<string>([
+    ...existingKeyFiles.map((kf) => kf.path),
+    ...csprojFiles.map((c) => c.path),
+    ...ciWorkflows,
+  ]);
+  const allSourceFiles = fileTree
+    .filter((p) => {
+      if (configPaths.has(p)) { return false; }
+      const ext = '.' + p.split('.').pop();
+      if (!SOURCE_EXTENSIONS.has(ext)) { return false; }
+      if (isIgnoredByMigrationIgnore(p, ignoreRules)) { return false; }
+      if (isBlockedFile(p)) { return false; }
+      const topFolder = p.split('/')[0];
+      return !SKIP_SAMPLE_DIRS.has(topFolder);
+    })
+    .sort((a, b) => a.split('/').length - b.split('/').length || a.localeCompare(b))
+    .slice(0, maxSourceFiles);
+
+  const allToFetch: Array<{ path: string; type: KeyFile['type'] }> = [
+    ...existingKeyFiles,
+    ...csprojFiles.filter((c) => !existingKeyFiles.some((kf) => kf.path === c.path)),
+    ...ciWorkflows
+      .filter((p) => !existingKeyFiles.some((kf) => kf.path === p))
+      .map((p) => ({ path: p, type: 'ci' as KeyFile['type'] })),
+    ...allSourceFiles.map((p) => ({ path: p, type: 'source' as KeyFile['type'] })),
+  ];
+
+  onProgress(`Reading ${allToFetch.length} files and scanning for secrets…`, 3, STEPS);
+
+  const skippedFiles: string[] = [];
+  const filesWithSecrets: string[] = [];
+  let totalRedactions = 0;
+
+  const keyFiles: KeyFile[] = [];
+  for (const { path, type } of allToFetch) {
+    if (isBlockedFile(path)) { skippedFiles.push(path); continue; }
+    const raw = readLocalFile(rootFsPath, path);
+    if (raw === null) { continue; }
+    const limit = type === 'source' ? 6000 : 8000;
+    const truncated = raw.length > limit ? raw.slice(0, limit) + '\n... (truncated)' : raw;
+    const { redacted, count } = redactSecrets(truncated);
+    if (count > 0) { filesWithSecrets.push(path); totalRedactions += count; }
+    keyFiles.push({ path, type, content: redacted, redactedCount: count });
+  }
+
+  const redactionSummary: RedactionSummary = { totalRedactions, filesWithSecrets, skippedFiles };
+
+  onProgress('Detecting stack…', 4, STEPS);
+
+  const detectedStack = detectStack(keyFiles, fileTree, 'Unknown');
+  const repoInfo: RepoInfo = {
+    owner: parentName,
+    repo: repoName,
+    hostname: 'local',
+    defaultBranch: readLocalDefaultBranch(rootFsPath),
+    description: `Local folder: ${rootFsPath}`,
+    language: detectedStack.primaryLanguage,
+    stars: 0,
+    size: 0,
+  };
+
+  const envVarInventory = scanEnvVarUsages(keyFiles);
+  const dependencyUsage = analyzeDependencyUsage(
+    { ...detectedStack.dependencies, ...detectedStack.devDependencies },
+    keyFiles
+  );
+  const monorepoPackages = detectMonorepoPackages(fileTree, keyFiles);
+
+  return {
+    repoInfo,
+    detectedStack,
+    keyFiles,
+    fileTree,
+    totalFiles: fileTree.length,
+    redactionSummary,
+    ...(envVarInventory.length > 0 ? { envVarInventory } : {}),
+    ...(Object.keys(dependencyUsage).length > 0 ? { dependencyUsage } : {}),
+    ...(monorepoPackages.length > 0 ? { monorepoPackages } : {}),
+  };
+}
+
+/**
+ * Analyze several local repositories as ONE project. Each repo is analyzed
+ * individually, then merged into a single RepoAnalysis where every path is
+ * prefixed with its repo name (e.g. "api/src/index.ts"). This lets the plan,
+ * architecture and security teams reason across repo boundaries — exactly what
+ * you want when a project is split across multiple repos in one parent folder.
+ */
+export async function analyzeLocalRepositories(
+  rootFsPaths: string[],
+  onProgress: (msg: string, step: number, total: number) => void
+): Promise<RepoAnalysis> {
+  if (rootFsPaths.length === 1) {
+    return analyzeLocalRepository(rootFsPaths[0], onProgress);
+  }
+
+  // Share a source-file budget across repos so the combined analysis stays a
+  // manageable size for the chunked LLM pass (≈120 source files total).
+  const perRepoBudget = Math.max(20, Math.floor(120 / rootFsPaths.length));
+
+  const perRepo: Array<{ name: string; analysis: RepoAnalysis }> = [];
+  for (let i = 0; i < rootFsPaths.length; i++) {
+    const name = nodePath.basename(rootFsPaths[i]);
+    onProgress(`Analyzing ${name} (${i + 1}/${rootFsPaths.length})…`, i + 1, rootFsPaths.length + 1);
+    const analysis = await analyzeLocalRepository(rootFsPaths[i], () => { /* per-repo progress suppressed */ }, perRepoBudget);
+    perRepo.push({ name, analysis });
+  }
+
+  onProgress('Merging repositories into one project view…', rootFsPaths.length + 1, rootFsPaths.length + 1);
+
+  const prefix = (p: string, name: string) => `${name}/${p}`;
+  const fileTree: string[] = [];
+  const keyFiles: KeyFile[] = [];
+  const filesWithSecrets: string[] = [];
+  const skippedFiles: string[] = [];
+  let totalRedactions = 0;
+  const dependencies: Record<string, string> = {};
+  const devDependencies: Record<string, string> = {};
+  const databases = new Set<string>();
+  const testing = new Set<string>();
+  const frameworks: string[] = [];
+  const monorepoPackages: string[] = [];
+
+  for (const { name, analysis } of perRepo) {
+    const ds = analysis.detectedStack;
+    for (const f of analysis.fileTree) { fileTree.push(prefix(f, name)); }
+    for (const kf of analysis.keyFiles) { keyFiles.push({ ...kf, path: prefix(kf.path, name) }); }
+    totalRedactions += analysis.redactionSummary.totalRedactions;
+    filesWithSecrets.push(...analysis.redactionSummary.filesWithSecrets.map((p) => prefix(p, name)));
+    skippedFiles.push(...analysis.redactionSummary.skippedFiles.map((p) => prefix(p, name)));
+    Object.assign(dependencies, ds.dependencies);
+    Object.assign(devDependencies, ds.devDependencies);
+    ds.databases.forEach((d) => databases.add(d));
+    ds.testingFrameworks.forEach((t) => testing.add(t));
+    frameworks.push(`${name}: ${ds.framework} (${ds.primaryLanguage})`);
+    (analysis.monorepoPackages ?? []).forEach((p) => monorepoPackages.push(`${name}/${p}`));
+  }
+
+  const langs = Array.from(new Set(perRepo.map((r) => r.analysis.detectedStack.primaryLanguage).filter((l) => l && l !== 'Unknown')));
+  const uniq = (xs: string[]) => Array.from(new Set(xs.filter((x) => x && x !== 'Unknown' && x !== 'None')));
+
+  const detectedStack: DetectedStack = {
+    primaryLanguage: langs.length > 1 ? `Polyglot (${langs.join(', ')})` : (langs[0] || 'Unknown'),
+    framework: frameworks.join(' | '),
+    runtime: uniq(perRepo.map((r) => r.analysis.detectedStack.runtime)).join(', ') || 'Unknown',
+    buildTool: uniq(perRepo.map((r) => r.analysis.detectedStack.buildTool)).join(', ') || 'Unknown',
+    packageManager: uniq(perRepo.map((r) => r.analysis.detectedStack.packageManager)).join(', ') || 'Unknown',
+    containerized: perRepo.some((r) => r.analysis.detectedStack.containerized),
+    ciSystem: uniq(perRepo.map((r) => r.analysis.detectedStack.ciSystem)).join(', ') || 'None',
+    databases: Array.from(databases),
+    testingFrameworks: Array.from(testing),
+    dependencies,
+    devDependencies,
+    currentVersion: perRepo.map((r) => `${r.name}: ${r.analysis.detectedStack.currentVersion}`).join(', '),
+  };
+
+  // Recompute env vars and dependency usage over the merged (prefixed) key files
+  const envVarInventory = scanEnvVarUsages(keyFiles);
+  const dependencyUsage = analyzeDependencyUsage({ ...dependencies, ...devDependencies }, keyFiles);
+
+  const parentName = nodePath.basename(nodePath.dirname(rootFsPaths[0])) || 'local';
+  const repoInfo: RepoInfo = {
+    owner: parentName,
+    repo: `${parentName} (${perRepo.length} repos)`,
+    hostname: 'local',
+    defaultBranch: 'main',
+    description: `Multi-repo project — ${perRepo.map((r) => r.name).join(', ')}`,
+    language: detectedStack.primaryLanguage,
+    stars: 0,
+    size: 0,
+  };
+
+  return {
+    repoInfo,
+    detectedStack,
+    keyFiles,
+    fileTree,
+    totalFiles: fileTree.length,
+    redactionSummary: { totalRedactions, filesWithSecrets, skippedFiles },
+    ...(envVarInventory.length > 0 ? { envVarInventory } : {}),
+    ...(Object.keys(dependencyUsage).length > 0 ? { dependencyUsage } : {}),
+    ...(monorepoPackages.length > 0 ? { monorepoPackages } : {}),
+    subRepos: perRepo.map((r) => r.name),
+  };
+}
+
+/**
+ * Narrow a merged multi-repo analysis down to a single sub-repo: filters and
+ * un-prefixes its files, then re-detects the stack so a correction run can focus
+ * on just that repo. Chunk summaries are intentionally dropped so they are
+ * regenerated for the focused file set.
+ */
+export function focusAnalysisOnSubRepo(analysis: RepoAnalysis, repoName: string): RepoAnalysis {
+  const prefix = `${repoName}/`;
+  const keyFiles = analysis.keyFiles
+    .filter((f) => f.path.startsWith(prefix))
+    .map((f) => ({ ...f, path: f.path.slice(prefix.length) }));
+  const fileTree = analysis.fileTree
+    .filter((p) => p.startsWith(prefix))
+    .map((p) => p.slice(prefix.length));
+
+  const detectedStack = detectStack(keyFiles, fileTree, 'Unknown');
+  const envVarInventory = scanEnvVarUsages(keyFiles);
+  const dependencyUsage = analyzeDependencyUsage(
+    { ...detectedStack.dependencies, ...detectedStack.devDependencies }, keyFiles
+  );
+  const monorepoPackages = detectMonorepoPackages(fileTree, keyFiles);
+
+  return {
+    repoInfo: { ...analysis.repoInfo, repo: repoName, description: `Focused on ${repoName}` },
+    detectedStack,
+    keyFiles,
+    fileTree,
+    totalFiles: fileTree.length,
+    redactionSummary: analysis.redactionSummary,
     ...(envVarInventory.length > 0 ? { envVarInventory } : {}),
     ...(Object.keys(dependencyUsage).length > 0 ? { dependencyUsage } : {}),
     ...(monorepoPackages.length > 0 ? { monorepoPackages } : {}),

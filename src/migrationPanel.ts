@@ -1,8 +1,16 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
-import { analyzeRepository, analyzeOrg, fetchBranchDiff } from './githubAnalyzer';
+import { analyzeRepository, analyzeOrg, fetchBranchDiff, scanLocalFolder, analyzeLocalRepository, analyzeLocalRepositories, focusAnalysisOnSubRepo, backupRepoFolder, readRepoFileFull, writeRepoFile } from './githubAnalyzer';
 import {
   streamMigrationPlan,
+  streamMigrationPlanTeam,
+  streamMigrationPlanTeamDelta,
+  streamArchitectureDoc,
+  streamSecurityAudit,
+  streamCorrectionPlan,
+  rewriteFilePreservingBehavior,
+  TeamCallbacks,
+  TeamDiscussion,
   streamSingleSection,
   streamCoherenceCheck,
   streamDebugHelp,
@@ -49,6 +57,7 @@ export class MigrationPanel {
   private readonly _panel: vscode.WebviewPanel;
   private readonly _secrets: vscode.SecretStorage;
   private readonly _globalState: vscode.Memento;
+  private readonly _extensionUri: vscode.Uri;
   private _disposables: vscode.Disposable[] = [];
   private _cancellationSource?: vscode.CancellationTokenSource;
   private _lastAnalysis?: RepoAnalysis;
@@ -58,6 +67,11 @@ export class MigrationPanel {
   private _lastOptions?: AnalysisOptions;
   private _chatHistory: ChatMessage[] = [];
   private _pendingStackChange?: StackChangeIntent;
+  private _lastTeamDiscussion?: TeamDiscussion; // cached so a re-target can reuse it
+  private _lastArchitecture = '';               // last generated LLD document
+  private _lastSecurity = '';                    // last generated vulnerability report
+  private _lastCorrection = '';                  // last generated correction plan
+  private _applyRoots: Array<{ name: string; path: string }> = []; // local roots writable for apply
 
   // ─── Static Factory ──────────────────────────────────────────────────────────
 
@@ -82,16 +96,17 @@ export class MigrationPanel {
       }
     );
 
-    MigrationPanel.currentPanel = new MigrationPanel(panel, context.secrets, context.globalState);
+    MigrationPanel.currentPanel = new MigrationPanel(panel, context.secrets, context.globalState, context.extensionUri);
     return MigrationPanel.currentPanel;
   }
 
   // ─── Constructor ──────────────────────────────────────────────────────────────
 
-  private constructor(panel: vscode.WebviewPanel, secrets: vscode.SecretStorage, globalState: vscode.Memento) {
+  private constructor(panel: vscode.WebviewPanel, secrets: vscode.SecretStorage, globalState: vscode.Memento, extensionUri: vscode.Uri) {
     this._panel = panel;
     this._secrets = secrets;
     this._globalState = globalState;
+    this._extensionUri = extensionUri;
 
     this._panel.webview.html = this._getWebviewContent();
 
@@ -125,6 +140,22 @@ export class MigrationPanel {
         await this._runAnalysis(msg.repoUrl!, msg.githubToken);
         break;
 
+      case 'browseLocalFolder':
+        await this._browseLocalFolder();
+        break;
+
+      case 'analyzeLocal':
+        if (msg.localPath) {
+          await this._runLocalAnalysis(msg.localPath);
+        }
+        break;
+
+      case 'analyzeLocalMulti':
+        if (msg.localPaths?.length) {
+          await this._runLocalMultiAnalysis(msg.localPaths);
+        }
+        break;
+
       case 'generatePlan':
         if (!this._lastAnalysis) {
           this._post({ type: 'error', message: 'Please analyze a repository first.' });
@@ -135,6 +166,46 @@ export class MigrationPanel {
           msg.targetStack!,
           msg.options!
         );
+        break;
+
+      case 'generateArchitecture':
+        if (!this._lastAnalysis) {
+          this._post({ type: 'archError', message: 'Please analyze a repository first.' });
+          return;
+        }
+        await this._runArchitecture(this._lastAnalysis);
+        break;
+
+      case 'saveArchitecture':
+        await this._saveArchitectureToFile(this._lastArchitecture);
+        break;
+
+      case 'generateSecurity':
+        if (!this._lastAnalysis) {
+          this._post({ type: 'secError', message: 'Please analyze a repository first.' });
+          return;
+        }
+        await this._runSecurity(this._lastAnalysis);
+        break;
+
+      case 'saveSecurity':
+        await this._saveSecurityToFile(this._lastSecurity);
+        break;
+
+      case 'generateCorrection':
+        if (!this._lastAnalysis) {
+          this._post({ type: 'corrError', message: 'Please analyze a repository or folder first.' });
+          return;
+        }
+        await this._runCorrection(msg.scopeRepo);
+        break;
+
+      case 'saveCorrection':
+        await this._saveCorrectionToFile(this._lastCorrection);
+        break;
+
+      case 'applyCorrection':
+        await this._applyCorrection(msg.scopeRepo);
         break;
 
       case 'stopGeneration':
@@ -282,7 +353,8 @@ export class MigrationPanel {
     const cached = this._getCachedAnalysis(repoUrl);
     if (cached) {
       this._lastAnalysis = cached.analysis;
-      this._post({ type: 'analysisComplete', analysis: cached.analysis });
+      this._applyRoots = [];
+      this._post({ type: 'analysisComplete', analysis: cached.analysis, canApply: false });
       this._post({ type: 'cacheHit', cachedAt: cached.timestamp });
       this._generateAndPostPresets(cached.analysis);
       return;
@@ -299,7 +371,67 @@ export class MigrationPanel {
 
       this._setCachedAnalysis(repoUrl, analysis);
       this._lastAnalysis = analysis;
-      this._post({ type: 'analysisComplete', analysis });
+      this._applyRoots = []; // GitHub repos aren't on disk — code-apply unavailable
+      this._post({ type: 'analysisComplete', analysis, canApply: false });
+      this._generateAndPostPresets(analysis);
+    } catch (err: any) {
+      this._post({ type: 'error', message: err.message || String(err) });
+    }
+  }
+
+  // ─── Local Folder Browsing ────────────────────────────────────────────────────
+
+  /** Open a folder picker and report the code repositories found inside. */
+  private async _browseLocalFolder(): Promise<void> {
+    const picked = await vscode.window.showOpenDialog({
+      canSelectFolders: true,
+      canSelectFiles: false,
+      canSelectMany: false,
+      openLabel: 'Select project folder',
+      title: 'Select the folder that contains your repositories',
+    });
+    if (!picked || picked.length === 0) { return; }
+
+    const root = picked[0].fsPath;
+    try {
+      const { repos } = await scanLocalFolder(root);
+      if (repos.length === 0) {
+        this._post({ type: 'error', message: `No code repositories found in "${root}". Pick a folder that contains a project (package.json, pom.xml, go.mod, etc.) or repo subfolders.` });
+        return;
+      }
+      this._post({ type: 'localReposFound', localRoot: root, localRepos: repos });
+    } catch (err: any) {
+      this._post({ type: 'error', message: err.message || String(err) });
+    }
+  }
+
+  /** Analyze a repository that lives on the local filesystem. Not cached —
+   *  local files change often and re-reading from disk is cheap. */
+  private async _runLocalAnalysis(fsPath: string): Promise<void> {
+    try {
+      const analysis = await analyzeLocalRepository(
+        fsPath,
+        (message, step, total) => this._post({ type: 'progress', message, step, totalSteps: total })
+      );
+      this._lastAnalysis = analysis;
+      this._applyRoots = [{ name: path.basename(fsPath), path: fsPath }];
+      this._post({ type: 'analysisComplete', analysis, canApply: true });
+      this._generateAndPostPresets(analysis);
+    } catch (err: any) {
+      this._post({ type: 'error', message: err.message || String(err) });
+    }
+  }
+
+  /** Analyze several local repos together as one project. Not cached. */
+  private async _runLocalMultiAnalysis(fsPaths: string[]): Promise<void> {
+    try {
+      const analysis = await analyzeLocalRepositories(
+        fsPaths,
+        (message, step, total) => this._post({ type: 'progress', message, step, totalSteps: total })
+      );
+      this._lastAnalysis = analysis;
+      this._applyRoots = fsPaths.map((p) => ({ name: path.basename(p), path: p }));
+      this._post({ type: 'analysisComplete', analysis, canApply: true });
       this._generateAndPostPresets(analysis);
     } catch (err: any) {
       this._post({ type: 'error', message: err.message || String(err) });
@@ -321,6 +453,408 @@ export class MigrationPanel {
   }
 
   // ─── Migration Plan ───────────────────────────────────────────────────────────
+
+  /** Wires the agent-team events to webview messages and caches the discussion. */
+  private _teamCallbacks(): TeamCallbacks {
+    return {
+      onTeamFormed: (agents) => this._post({ type: 'teamFormed', agents }),
+      onAgentStart: (agent, phase) => this._post({
+        type: 'agentMessageStart',
+        agentId: agent.id,
+        agentRole: agent.role,
+        agentEmoji: agent.emoji,
+        agentPhase: phase,
+      }),
+      onAgentChunk: (agentId, chunk) => this._post({ type: 'agentMessageChunk', agentId, chunk }),
+      onAgentEnd: (agentId) => this._post({ type: 'agentMessageEnd', agentId }),
+      onDiscussionComplete: (discussion) => { this._lastTeamDiscussion = discussion; },
+    };
+  }
+
+  /** Team-event callbacks for the architecture (LLD) flow → arch-prefixed messages. */
+  private _archTeamCallbacks(): TeamCallbacks {
+    return {
+      onTeamFormed: (agents) => this._post({ type: 'archTeamFormed', agents }),
+      onAgentStart: (agent, phase) => this._post({
+        type: 'archAgentMessageStart',
+        agentId: agent.id,
+        agentRole: agent.role,
+        agentEmoji: agent.emoji,
+        agentPhase: phase,
+      }),
+      onAgentChunk: (agentId, chunk) => this._post({ type: 'archAgentMessageChunk', agentId, chunk }),
+      onAgentEnd: (agentId) => this._post({ type: 'archAgentMessageEnd', agentId }),
+    };
+  }
+
+  // ─── Architecture / Low-Level Design Documentation ────────────────────────────
+
+  private async _runArchitecture(analysis: RepoAnalysis): Promise<void> {
+    // ── Security confirmation — generating the LLD sends code to Copilot ───────
+    const choice = await vscode.window.showWarningMessage(
+      `Generate architecture documentation?\n\n` +
+      `This sends your analyzed source files, file tree and dependency names to GitHub Copilot ` +
+      `to produce a deep low-level design document.`,
+      { modal: true },
+      'Send to Copilot',
+      'Cancel'
+    );
+    if (choice !== 'Send to Copilot') {
+      this._post({ type: 'stopped' });
+      return;
+    }
+
+    this._cancellationSource?.cancel();
+    this._cancellationSource = new vscode.CancellationTokenSource();
+    const token = this._cancellationSource.token;
+
+    // The LLD is far richer when the full codebase has been summarised. Run the
+    // chunked analysis once if it hasn't happened yet (e.g. arch before plan).
+    const sourceFileCount = analysis.keyFiles.filter((f) => f.type === 'source').length;
+    if (!analysis.chunkSummaries?.length && sourceFileCount > 0) {
+      const chunkTotal = Math.ceil(sourceFileCount / 10);
+      this._post({ type: 'progress', message: `Analysing ${sourceFileCount} source files in ${chunkTotal} groups…`, step: 1, totalSteps: chunkTotal + 1 });
+      const chunkSummaries = await analyzeFilesInChunks(
+        analysis,
+        (msg, done, total) => this._post({ type: 'progress', message: msg, step: done + 1, totalSteps: total + 1 }),
+        token
+      );
+      analysis = { ...analysis, chunkSummaries };
+      this._lastAnalysis = analysis;
+    }
+
+    this._lastArchitecture = '';
+    this._post({ type: 'archChunk', chunk: '' }); // clear signal
+
+    try {
+      const failedSections = await streamArchitectureDoc(
+        analysis,
+        (chunk) => {
+          this._lastArchitecture += chunk;
+          this._post({ type: 'archChunk', chunk });
+        },
+        token,
+        (index, total, heading) => {
+          this._post({ type: 'archSectionProgress', sectionIndex: index, sectionTotal: total, sectionHeading: heading });
+        },
+        this._archTeamCallbacks()
+      );
+      this._post({ type: 'archComplete', failedSections });
+    } catch (err: any) {
+      if (token.isCancellationRequested) {
+        this._post({ type: 'stopped' });
+      } else {
+        this._post({ type: 'archError', message: err.message || String(err) });
+      }
+    }
+  }
+
+  private async _saveArchitectureToFile(doc: string): Promise<void> {
+    if (!doc.trim()) {
+      this._post({ type: 'archError', message: 'No architecture document to save.' });
+      return;
+    }
+    const repo = this._lastAnalysis?.repoInfo.repo ?? 'project';
+    const defaultUri = vscode.Uri.file(path.join(vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '', `${repo}-architecture.md`));
+    const uri = await vscode.window.showSaveDialog({
+      defaultUri,
+      filters: { Markdown: ['md'], Text: ['txt'] },
+      saveLabel: 'Save Architecture Doc',
+    });
+    if (uri) {
+      await vscode.workspace.fs.writeFile(uri, Buffer.from(doc, 'utf-8'));
+      this._post({ type: 'architectureSaved' });
+      vscode.window.showInformationMessage(`Architecture documentation saved to ${uri.fsPath}`);
+    }
+  }
+
+  // ─── Security / Vulnerability Audit ───────────────────────────────────────────
+
+  /** Team-event callbacks for the security flow → sec-prefixed messages. */
+  private _secTeamCallbacks(): TeamCallbacks {
+    return {
+      onTeamFormed: (agents) => this._post({ type: 'secTeamFormed', agents }),
+      onAgentStart: (agent, phase) => this._post({
+        type: 'secAgentMessageStart',
+        agentId: agent.id,
+        agentRole: agent.role,
+        agentEmoji: agent.emoji,
+        agentPhase: phase,
+      }),
+      onAgentChunk: (agentId, chunk) => this._post({ type: 'secAgentMessageChunk', agentId, chunk }),
+      onAgentEnd: (agentId) => this._post({ type: 'secAgentMessageEnd', agentId }),
+    };
+  }
+
+  private async _runSecurity(analysis: RepoAnalysis): Promise<void> {
+    // ── Security confirmation — auditing sends code to Copilot ─────────────────
+    const choice = await vscode.window.showWarningMessage(
+      `Run a whole-project security audit?\n\n` +
+      `This sends your analyzed source files, file tree and dependency names to GitHub Copilot ` +
+      `so a team of security analysts can find and triage vulnerabilities.`,
+      { modal: true },
+      'Send to Copilot',
+      'Cancel'
+    );
+    if (choice !== 'Send to Copilot') {
+      this._post({ type: 'stopped' });
+      return;
+    }
+
+    this._cancellationSource?.cancel();
+    this._cancellationSource = new vscode.CancellationTokenSource();
+    const token = this._cancellationSource.token;
+
+    // The audit is far more accurate with the full codebase summarised. Run the
+    // chunked analysis once if it hasn't happened yet.
+    const sourceFileCount = analysis.keyFiles.filter((f) => f.type === 'source').length;
+    if (!analysis.chunkSummaries?.length && sourceFileCount > 0) {
+      const chunkTotal = Math.ceil(sourceFileCount / 10);
+      this._post({ type: 'progress', message: `Analysing ${sourceFileCount} source files in ${chunkTotal} groups…`, step: 1, totalSteps: chunkTotal + 1 });
+      const chunkSummaries = await analyzeFilesInChunks(
+        analysis,
+        (msg, done, total) => this._post({ type: 'progress', message: msg, step: done + 1, totalSteps: total + 1 }),
+        token
+      );
+      analysis = { ...analysis, chunkSummaries };
+      this._lastAnalysis = analysis;
+    }
+
+    this._lastSecurity = '';
+    this._post({ type: 'secChunk', chunk: '' }); // clear signal
+
+    try {
+      const failedSections = await streamSecurityAudit(
+        analysis,
+        (chunk) => {
+          this._lastSecurity += chunk;
+          this._post({ type: 'secChunk', chunk });
+        },
+        token,
+        (index, total, heading) => {
+          this._post({ type: 'secSectionProgress', sectionIndex: index, sectionTotal: total, sectionHeading: heading });
+        },
+        this._secTeamCallbacks()
+      );
+      this._post({ type: 'secComplete', failedSections });
+    } catch (err: any) {
+      if (token.isCancellationRequested) {
+        this._post({ type: 'stopped' });
+      } else {
+        this._post({ type: 'secError', message: err.message || String(err) });
+      }
+    }
+  }
+
+  private async _saveSecurityToFile(doc: string): Promise<void> {
+    if (!doc.trim()) {
+      this._post({ type: 'secError', message: 'No security report to save.' });
+      return;
+    }
+    const repo = this._lastAnalysis?.repoInfo.repo ?? 'project';
+    const defaultUri = vscode.Uri.file(path.join(vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '', `${repo}-security-report.md`));
+    const uri = await vscode.window.showSaveDialog({
+      defaultUri,
+      filters: { Markdown: ['md'], Text: ['txt'] },
+      saveLabel: 'Save Security Report',
+    });
+    if (uri) {
+      await vscode.workspace.fs.writeFile(uri, Buffer.from(doc, 'utf-8'));
+      this._post({ type: 'securitySaved' });
+      vscode.window.showInformationMessage(`Security report saved to ${uri.fsPath}`);
+    }
+  }
+
+  // ─── Behavior-Preserving Correction ───────────────────────────────────────────
+
+  /** Team-event callbacks for the correction flow → corr-prefixed messages. */
+  private _corrTeamCallbacks(): TeamCallbacks {
+    return {
+      onTeamFormed: (agents) => this._post({ type: 'corrTeamFormed', agents }),
+      onAgentStart: (agent, phase) => this._post({
+        type: 'corrAgentMessageStart',
+        agentId: agent.id,
+        agentRole: agent.role,
+        agentEmoji: agent.emoji,
+        agentPhase: phase,
+      }),
+      onAgentChunk: (agentId, chunk) => this._post({ type: 'corrAgentMessageChunk', agentId, chunk }),
+      onAgentEnd: (agentId) => this._post({ type: 'corrAgentMessageEnd', agentId }),
+    };
+  }
+
+  /** Run the correction team on the whole project or a single focused sub-repo. */
+  private async _runCorrection(scopeRepo?: string): Promise<void> {
+    let analysis = this._lastAnalysis!;
+    const focused = !!(scopeRepo && analysis.subRepos?.includes(scopeRepo));
+    if (focused) {
+      analysis = focusAnalysisOnSubRepo(analysis, scopeRepo!);
+    }
+
+    const scopeName = focused ? `the "${scopeRepo}" repository` : 'the whole project';
+    const choice = await vscode.window.showWarningMessage(
+      `Generate a behavior-preserving correction plan for ${scopeName}?\n\n` +
+      `A team of engineers will study the code and propose structural/quality fixes only — ` +
+      `no business logic will be changed. Your source files are sent to GitHub Copilot.`,
+      { modal: true },
+      'Send to Copilot',
+      'Cancel'
+    );
+    if (choice !== 'Send to Copilot') {
+      this._post({ type: 'stopped' });
+      return;
+    }
+
+    this._cancellationSource?.cancel();
+    this._cancellationSource = new vscode.CancellationTokenSource();
+    const token = this._cancellationSource.token;
+
+    // Ensure the full-codebase summaries exist for the (possibly focused) analysis.
+    const sourceFileCount = analysis.keyFiles.filter((f) => f.type === 'source').length;
+    if (!analysis.chunkSummaries?.length && sourceFileCount > 0) {
+      const chunkTotal = Math.ceil(sourceFileCount / 10);
+      this._post({ type: 'progress', message: `Analysing ${sourceFileCount} source files in ${chunkTotal} groups…`, step: 1, totalSteps: chunkTotal + 1 });
+      const chunkSummaries = await analyzeFilesInChunks(
+        analysis,
+        (msg, done, total) => this._post({ type: 'progress', message: msg, step: done + 1, totalSteps: total + 1 }),
+        token
+      );
+      analysis = { ...analysis, chunkSummaries };
+      // Only cache back onto the shared analysis when not focused (focused is a slice)
+      if (!focused) { this._lastAnalysis = analysis; }
+    }
+
+    this._lastCorrection = '';
+    this._post({ type: 'corrChunk', chunk: '' }); // clear signal
+
+    try {
+      const failedSections = await streamCorrectionPlan(
+        analysis,
+        (chunk) => {
+          this._lastCorrection += chunk;
+          this._post({ type: 'corrChunk', chunk });
+        },
+        token,
+        (index, total, heading) => {
+          this._post({ type: 'corrSectionProgress', sectionIndex: index, sectionTotal: total, sectionHeading: heading });
+        },
+        this._corrTeamCallbacks()
+      );
+      this._post({ type: 'corrComplete', failedSections });
+    } catch (err: any) {
+      if (token.isCancellationRequested) {
+        this._post({ type: 'stopped' });
+      } else {
+        this._post({ type: 'corrError', message: err.message || String(err) });
+      }
+    }
+  }
+
+  /**
+   * Apply the correction in place: back up each target folder, then rewrite its
+   * source files preserving behavior. Local-only; files with secrets and oversized
+   * files are skipped; a global cap bounds the number of rewrites per run.
+   */
+  private async _applyCorrection(scopeRepo?: string): Promise<void> {
+    if (!this._lastAnalysis) {
+      this._post({ type: 'applyError', message: 'Analyze a folder first.' });
+      return;
+    }
+    if (this._applyRoots.length === 0) {
+      this._post({ type: 'applyError', message: 'Apply only works on locally-analyzed folders (not GitHub URLs). Use 📁 Browse Local Folder.' });
+      return;
+    }
+    if (!this._lastCorrection.trim()) {
+      this._post({ type: 'applyError', message: 'Generate a correction plan first, then apply it.' });
+      return;
+    }
+
+    let roots = this._applyRoots;
+    if (scopeRepo) { roots = roots.filter((r) => r.name === scopeRepo); }
+    if (roots.length === 0) {
+      this._post({ type: 'applyError', message: `Couldn't find the local path for "${scopeRepo}".` });
+      return;
+    }
+
+    const choice = await vscode.window.showWarningMessage(
+      `Apply corrections to ${roots.length} folder(s)?\n\n${roots.map((r) => r.path).join('\n')}\n\n` +
+      `• A backup copy of each folder is made first (excludes node_modules/.git).\n` +
+      `• Full file contents are sent to GitHub Copilot to be rewritten.\n` +
+      `• Only structure/quality changes — behavior is preserved — but you MUST review the diff and run your tests afterward.`,
+      { modal: true },
+      'Backup & Apply',
+      'Cancel'
+    );
+    if (choice !== 'Backup & Apply') {
+      this._post({ type: 'stopped' });
+      return;
+    }
+
+    this._cancellationSource?.cancel();
+    this._cancellationSource = new vscode.CancellationTokenSource();
+    const token = this._cancellationSource.token;
+
+    const MAX_TOTAL = 60; // bound the number of rewrites per apply run
+    const backups: string[] = [];
+    const changed: string[] = [];
+    let attempts = 0;
+
+    try {
+      for (const root of roots) {
+        if (token.isCancellationRequested) { break; }
+        this._post({ type: 'applyProgress', message: `Backing up ${root.name}…` });
+        backups.push(await backupRepoFolder(root.path));
+
+        const focused = this._lastAnalysis.subRepos?.includes(root.name)
+          ? focusAnalysisOnSubRepo(this._lastAnalysis, root.name)
+          : this._lastAnalysis;
+        const secretFiles = focused.redactionSummary.filesWithSecrets;
+        const isSecret = (rel: string) => secretFiles.some((s) => s === rel || s.endsWith('/' + rel));
+        const sourceFiles = focused.keyFiles.filter((f) => f.type === 'source').map((f) => f.path);
+
+        for (let i = 0; i < sourceFiles.length; i++) {
+          if (token.isCancellationRequested || attempts >= MAX_TOTAL) { break; }
+          const rel = sourceFiles[i];
+          this._post({ type: 'applyProgress', message: `[${root.name}] ${i + 1}/${sourceFiles.length}: ${rel}` });
+          if (isSecret(rel)) { continue; } // never auto-edit files containing secrets
+          const full = readRepoFileFull(root.path, rel);
+          if (full === null) { continue; }
+          attempts++;
+          const updated = await rewriteFilePreservingBehavior(rel, full, this._lastCorrection, token);
+          if (updated && updated !== full) {
+            writeRepoFile(root.path, rel, updated);
+            changed.push(`${root.name}/${rel}`);
+          }
+        }
+      }
+      this._post({ type: 'applyComplete', appliedFiles: changed, backupPaths: backups });
+    } catch (err: any) {
+      if (token.isCancellationRequested) {
+        this._post({ type: 'applyComplete', appliedFiles: changed, backupPaths: backups });
+      } else {
+        this._post({ type: 'applyError', message: err.message || String(err) });
+      }
+    }
+  }
+
+  private async _saveCorrectionToFile(doc: string): Promise<void> {
+    if (!doc.trim()) {
+      this._post({ type: 'corrError', message: 'No correction plan to save.' });
+      return;
+    }
+    const repo = this._lastAnalysis?.repoInfo.repo ?? 'project';
+    const defaultUri = vscode.Uri.file(path.join(vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '', `${repo}-correction-plan.md`));
+    const uri = await vscode.window.showSaveDialog({
+      defaultUri,
+      filters: { Markdown: ['md'], Text: ['txt'] },
+      saveLabel: 'Save Correction Plan',
+    });
+    if (uri) {
+      await vscode.workspace.fs.writeFile(uri, Buffer.from(doc, 'utf-8'));
+      this._post({ type: 'correctionSaved' });
+      vscode.window.showInformationMessage(`Correction plan saved to ${uri.fsPath}`);
+    }
+  }
 
   private async _runMigrationPlan(
     analysis: RepoAnalysis,
@@ -386,10 +920,11 @@ export class MigrationPanel {
     this._lastTargetStack = targetStack;
     this._lastOptions = options;
     this._chatHistory = []; // new plan = fresh chat context
+    this._lastTeamDiscussion = undefined; // fresh team meeting for this run
     this._post({ type: 'planChunk', chunk: '' }); // clear signal
 
     try {
-      const failedSections = await streamMigrationPlan(
+      const failedSections = await streamMigrationPlanTeam(
         analysis,
         targetStack,
         options,
@@ -405,7 +940,8 @@ export class MigrationPanel {
             sectionTotal: total,
             sectionHeading: heading,
           });
-        }
+        },
+        this._teamCallbacks()
       );
 
       // ── Coherence check: validate the completed plan for contradictions,
@@ -497,7 +1033,9 @@ export class MigrationPanel {
     if (!entry) { return; }
     this._lastPlan = entry.plan;
     this._lastAnalysis = entry.analysis; // restore so debug/exec-summary/progress-check work
+    this._lastTargetStack = entry.targetStack;
     this._chatHistory = []; // fresh context for this history entry
+    this._lastTeamDiscussion = undefined; // no cached discussion for a loaded plan → re-target convenes full team
     // Replay the plan as chunks so the UI renders it
     this._post({ type: 'planChunk', chunk: '' });
     this._post({ type: 'planChunk', chunk: entry.plan });
@@ -944,19 +1482,25 @@ export class MigrationPanel {
       this._post({ type: 'planChunk', chunk: '' }); // clear signal
 
       try {
-        const regenFailed = await streamMigrationPlan(
-          this._lastAnalysis,   // already has chunkSummaries from the first run
-          updatedTarget,
-          options,
-          (chunk) => {
-            this._lastPlan += chunk;
-            this._post({ type: 'planChunk', chunk });
-          },
-          token,
-          (index, total, heading) => {
-            this._post({ type: 'sectionProgress', sectionIndex: index, sectionTotal: total, sectionHeading: heading });
-          }
-        );
+        const onChunkCb = (chunk: string) => {
+          this._lastPlan += chunk;
+          this._post({ type: 'planChunk', chunk });
+        };
+        const onSectionCb = (index: number, total: number, heading: string) => {
+          this._post({ type: 'sectionProgress', sectionIndex: index, sectionTotal: total, sectionHeading: heading });
+        };
+        // Reuse the cached team discussion (codebase is unchanged — only the
+        // target moved), so we run a lightweight re-targeting round instead of
+        // convening the full meeting again. No cache → full team meeting.
+        const regenFailed = this._lastTeamDiscussion
+          ? await streamMigrationPlanTeamDelta(
+              this._lastAnalysis, updatedTarget, baseTarget, options,
+              onChunkCb, token, onSectionCb, this._teamCallbacks(), this._lastTeamDiscussion
+            )
+          : await streamMigrationPlanTeam(
+              this._lastAnalysis, updatedTarget, options,
+              onChunkCb, token, onSectionCb, this._teamCallbacks()
+            );
         this._post({ type: 'planComplete', failedSections: regenFailed });
         const cfg = vscode.workspace.getConfiguration('migrationAssistant');
         await cfg.update('lastTargetStack', updatedTarget, vscode.ConfigurationTarget.Global);
@@ -1252,6 +1796,10 @@ export class MigrationPanel {
   // ─── Webview HTML ─────────────────────────────────────────────────────────────
 
   private _getWebviewContent(): string {
+    // Locally-bundled mermaid (lazy-loaded in the webview only when diagrams exist)
+    const mermaidUri = this._panel.webview.asWebviewUri(
+      vscode.Uri.joinPath(this._extensionUri, 'node_modules', 'mermaid', 'dist', 'mermaid.min.js')
+    );
     return /* html */ `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1572,6 +2120,39 @@ export class MigrationPanel {
     border-bottom-color: var(--vscode-focusBorder);
   }
   .tab:hover { color: var(--vscode-foreground); }
+
+  /* ── Grouped tab dropdowns ── */
+  .tab-group { position: relative; display: inline-flex; }
+  .tab-group-trigger {
+    padding: 8px 14px; font-size: 12px; cursor: pointer;
+    border: none; border-bottom: 2px solid transparent;
+    color: var(--vscode-descriptionForeground);
+    background: none; font-family: inherit; transition: color 0.15s;
+  }
+  .tab-group-trigger:hover { color: var(--vscode-foreground); }
+  .tab-group-trigger.has-active {
+    color: var(--vscode-foreground);
+    border-bottom-color: var(--vscode-focusBorder);
+  }
+  .tab-menu {
+    position: absolute; top: 100%; left: 0; z-index: 50;
+    display: none; flex-direction: column; min-width: 180px;
+    background: var(--vscode-dropdown-background, var(--vscode-editor-background));
+    border: 1px solid var(--vscode-panel-border);
+    border-radius: 0 0 6px 6px;
+    box-shadow: 0 6px 16px rgba(0,0,0,0.35);
+    padding: 4px;
+  }
+  .tab-group.open .tab-menu { display: flex; }
+  .tab-menu .tab {
+    width: 100%; text-align: left; padding: 7px 10px;
+    border-bottom: none; border-radius: 4px;
+  }
+  .tab-menu .tab:hover { background: var(--vscode-list-hoverBackground, rgba(255,255,255,0.06)); }
+  .tab-menu .tab.active {
+    background: var(--vscode-list-activeSelectionBackground, rgba(255,255,255,0.10));
+    color: var(--vscode-foreground); border-bottom-color: transparent;
+  }
 
   .tab-content { display: none; flex: 1; overflow: auto; padding: 16px; }
   .tab-content.active { display: block; }
@@ -2014,6 +2595,70 @@ export class MigrationPanel {
     0%, 80%, 100% { transform: scale(0.6); opacity: 0.4; }
     40% { transform: scale(1); opacity: 1; }
   }
+
+  /* ── Agent team discussion ── */
+  .team-roster {
+    display: flex; flex-wrap: wrap; gap: 8px;
+    padding: 12px; margin-bottom: 14px;
+    border: 1px solid var(--vscode-panel-border);
+    border-radius: 8px;
+    background: var(--vscode-editor-inactiveSelectionBackground);
+  }
+  .team-roster-title {
+    width: 100%; font-size: 11px; font-weight: 600; text-transform: uppercase;
+    letter-spacing: .04em; opacity: .65; margin-bottom: 2px;
+  }
+  .team-chip {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 4px 10px; border-radius: 14px; font-size: 12px;
+    background: var(--vscode-badge-background, rgba(255,255,255,0.08));
+    color: var(--vscode-badge-foreground, inherit);
+  }
+  .team-chip .em { font-size: 14px; }
+  .agent-msg {
+    display: flex; gap: 10px; margin: 0 0 14px; align-items: flex-start;
+    animation: agent-in .25s ease;
+  }
+  @keyframes agent-in { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+  .agent-avatar {
+    flex-shrink: 0; width: 30px; height: 30px; border-radius: 50%;
+    display: flex; align-items: center; justify-content: center; font-size: 16px;
+    background: var(--vscode-editor-inactiveSelectionBackground);
+    border: 1px solid var(--vscode-panel-border);
+  }
+  .agent-body {
+    flex: 1; min-width: 0;
+    background: var(--vscode-textBlockQuote-background, rgba(255,255,255,0.03));
+    border-left: 2px solid var(--vscode-focusBorder);
+    border-radius: 0 6px 6px 0; padding: 8px 12px;
+  }
+  .agent-meta { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+  .agent-name { font-weight: 600; font-size: 12px; }
+  .agent-phase {
+    font-size: 9px; text-transform: uppercase; letter-spacing: .04em;
+    padding: 1px 6px; border-radius: 8px; opacity: .8;
+    background: var(--vscode-badge-background, rgba(255,255,255,0.08));
+  }
+  .agent-phase.synthesis { background: var(--vscode-button-background, #0e639c); color: #fff; opacity: 1; }
+  .agent-text { font-size: 13px; line-height: 1.5; }
+  .agent-text p:last-child { margin-bottom: 0; }
+  .synthesis-progress {
+    display: flex; flex-direction: column; gap: 8px;
+    padding: 14px; margin: 4px 0 14px;
+    border: 1px dashed var(--vscode-panel-border); border-radius: 8px;
+  }
+  .synthesis-progress .sp-row { display: flex; align-items: center; gap: 8px; font-size: 13px; font-weight: 600; }
+  .synthesis-progress .sp-bar { height: 5px; border-radius: 3px; background: var(--vscode-input-background, rgba(255,255,255,0.08)); overflow: hidden; }
+  .synthesis-progress .sp-fill { height: 100%; width: 0; background: var(--vscode-button-background, #0e639c); transition: width .3s ease; }
+
+  /* ── Mermaid diagrams ── */
+  .mermaid-wrap .mermaid-render {
+    display: flex; justify-content: center; padding: 14px;
+    background: var(--vscode-textCodeBlock-background, rgba(255,255,255,0.03));
+    border-radius: 0 0 6px 6px; overflow: auto;
+  }
+  .mermaid-wrap .mermaid-render svg { max-width: 100%; height: auto; }
+  .mermaid-wrap .mmd-pending { font-size: 12px; opacity: 0.6; padding: 10px; }
 </style>
 </head>
 <body>
@@ -2061,6 +2706,21 @@ export class MigrationPanel {
       <button class="btn btn-primary" id="btn-analyze" style="margin-top:10px">
         🔍 Analyze Repository
       </button>
+      <div style="display:flex;align-items:center;gap:8px;margin:10px 0;opacity:0.5;font-size:11px">
+        <hr style="flex:1;border:none;border-top:1px solid var(--vscode-panel-border)"> or <hr style="flex:1;border:none;border-top:1px solid var(--vscode-panel-border)">
+      </div>
+      <button class="btn" id="btn-browse-local" style="width:100%;border:1px solid var(--vscode-button-border,var(--vscode-panel-border));background:var(--vscode-button-secondaryBackground);color:var(--vscode-button-secondaryForeground)">
+        📁 Browse Local Folder
+      </button>
+      <div id="local-repos" style="display:none;margin-top:8px">
+        <div class="section-title" style="margin-bottom:4px;display:flex;justify-content:space-between;align-items:center">
+          <span>Local repositories <span id="local-root" style="opacity:0.6;font-weight:400;text-transform:none"></span></span>
+          <label style="font-weight:400;text-transform:none;display:flex;align-items:center;gap:3px;cursor:pointer"><input type="checkbox" id="local-select-all"> all</label>
+        </div>
+        <div style="font-size:11px;opacity:0.6;margin-bottom:4px">Click a repo to analyze it, or tick several and analyze them as one project.</div>
+        <div id="local-repos-list" style="display:flex;flex-direction:column;gap:4px;max-height:220px;overflow:auto"></div>
+        <button id="btn-analyze-multi" class="btn btn-primary" style="margin-top:6px;display:none" disabled>🔗 Analyze selected together</button>
+      </div>
       <div id="progress-section" style="margin-top:10px; display:none">
         <div class="progress-bar-wrap">
           <div class="progress-bar" id="progress-bar" style="width:0%"></div>
@@ -2230,14 +2890,29 @@ export class MigrationPanel {
   <div class="content">
     <div class="content-tabs">
       <button class="tab active" data-tab="plan">Plan</button>
-      <button class="tab" data-tab="chat">💬 Chat</button>
-      <button class="tab" data-tab="previews">File Previews</button>
-      <button class="tab" data-tab="debug">Debug</button>
-      <button class="tab" data-tab="org">Org Dashboard</button>
-      <button class="tab" data-tab="progress">Progress</button>
-      <button class="tab" data-tab="files">Files</button>
-      <button class="tab" data-tab="security">Security</button>
-      <button class="tab" data-tab="raw">Raw</button>
+      <button class="tab" data-tab="architecture">🏛️ Architecture</button>
+      <button class="tab" data-tab="security-audit">🛡️ Vulnerabilities</button>
+      <button class="tab" data-tab="correction">🔧 Correct</button>
+
+      <div class="tab-group" id="group-insights">
+        <button class="tab-group-trigger" data-group="group-insights">Insights ▾</button>
+        <div class="tab-menu">
+          <button class="tab" data-tab="files">Files</button>
+          <button class="tab" data-tab="security">Security</button>
+          <button class="tab" data-tab="raw">Raw</button>
+        </div>
+      </div>
+
+      <div class="tab-group" id="group-tools">
+        <button class="tab-group-trigger" data-group="group-tools">Tools ▾</button>
+        <div class="tab-menu">
+          <button class="tab" data-tab="chat">💬 Chat</button>
+          <button class="tab" data-tab="previews">File Previews</button>
+          <button class="tab" data-tab="debug">Debug</button>
+          <button class="tab" data-tab="progress">Progress</button>
+          <button class="tab" data-tab="org">Org Dashboard</button>
+        </div>
+      </div>
     </div>
 
     <!-- Plan Tab -->
@@ -2286,6 +2961,108 @@ export class MigrationPanel {
           </div>
           <div id="plan-rendered" style="flex:1;overflow:auto"></div>
         </div>
+      </div>
+    </div>
+
+    <!-- Architecture (LLD) Tab -->
+    <div class="tab-content" id="tab-architecture">
+      <div id="arch-empty" class="empty-state">
+        <div class="empty-icon">🏛️</div>
+        <div class="empty-title">No architecture doc yet</div>
+        <div class="empty-sub">
+          Analyze a repository, then click <strong>Generate Architecture</strong>. A team of engineering
+          analysts will study the codebase, discuss how it fits together, and write a deep low-level design
+          document a new developer can onboard from.
+        </div>
+        <button id="btn-generate-arch" class="btn btn-primary" style="margin-top:14px" disabled>🏛️ Generate Architecture</button>
+      </div>
+      <div id="arch-container" style="display:none; height:100%; flex-direction:column">
+        <div class="plan-header">
+          <div id="arch-gen-indicator" class="generating-indicator" style="display:none">
+            <div class="dot-pulse"><span></span><span></span><span></span></div>
+            Documenting…
+          </div>
+          <div style="flex:1"></div>
+          <div style="display:flex;gap:6px;align-items:center">
+            <button class="copy-btn" id="btn-arch-regenerate" title="Regenerate the architecture doc">↻ Regenerate</button>
+            <button class="copy-btn" id="btn-arch-save" title="Save as Markdown" disabled>⬇ Save .md</button>
+            <button class="copy-btn" id="btn-arch-copy" disabled>Copy</button>
+            <button class="copy-btn" id="btn-arch-stop" style="display:none">■ Stop</button>
+          </div>
+        </div>
+        <div id="arch-rendered" style="flex:1;overflow:auto"></div>
+      </div>
+    </div>
+
+    <!-- Security / Vulnerability Audit Tab -->
+    <div class="tab-content" id="tab-security-audit">
+      <div id="sec-empty" class="empty-state">
+        <div class="empty-icon">🛡️</div>
+        <div class="empty-title">No security audit yet</div>
+        <div class="empty-sub">
+          Analyze a repository, then click <strong>Run Security Audit</strong>. A team of security
+          analysts will hunt for vulnerabilities across the whole project, correlate their findings,
+          and produce a severity-sorted report with where, why and how to fix each issue.
+        </div>
+        <button id="btn-generate-sec" class="btn btn-primary" style="margin-top:14px" disabled>🛡️ Run Security Audit</button>
+      </div>
+      <div id="sec-container" style="display:none; height:100%; flex-direction:column">
+        <div class="plan-header">
+          <div id="sec-gen-indicator" class="generating-indicator" style="display:none">
+            <div class="dot-pulse"><span></span><span></span><span></span></div>
+            Auditing…
+          </div>
+          <div id="sec-summary" style="display:none;gap:6px;align-items:center;flex-wrap:wrap"></div>
+          <div style="flex:1"></div>
+          <div style="display:flex;gap:6px;align-items:center">
+            <button class="copy-btn" id="btn-sec-regenerate" title="Re-run the security audit">↻ Re-run</button>
+            <button class="copy-btn" id="btn-sec-save" title="Save as Markdown" disabled>⬇ Save .md</button>
+            <button class="copy-btn" id="btn-sec-copy" disabled>Copy</button>
+            <button class="copy-btn" id="btn-sec-stop" style="display:none">■ Stop</button>
+          </div>
+        </div>
+        <div id="sec-rendered" style="flex:1;overflow:auto"></div>
+      </div>
+    </div>
+
+    <!-- Behavior-Preserving Correction Tab -->
+    <div class="tab-content" id="tab-correction">
+      <div id="corr-empty" class="empty-state">
+        <div class="empty-icon">🔧</div>
+        <div class="empty-title">No correction plan yet</div>
+        <div class="empty-sub">
+          Analyze a folder/repo, choose a scope, then click <strong>Generate Correction Plan</strong>.
+          A large engineering team studies the code and proposes structure & quality fixes only —
+          <strong>no business logic is changed</strong>. A Behavior-Preservation Guardian locks the
+          invariants and gives you a checklist to prove it still works as-is.
+        </div>
+        <div style="display:flex;gap:8px;align-items:center;margin-top:14px;flex-wrap:wrap;justify-content:center">
+          <label style="font-size:12px">Scope:
+            <select id="corr-scope" class="copy-btn" style="cursor:pointer">
+              <option value="">Whole project</option>
+            </select>
+          </label>
+          <button id="btn-generate-corr" class="btn btn-primary" disabled>🔧 Generate Correction Plan</button>
+        </div>
+      </div>
+      <div id="corr-container" style="display:none; height:100%; flex-direction:column">
+        <div class="plan-header">
+          <div id="corr-gen-indicator" class="generating-indicator" style="display:none">
+            <div class="dot-pulse"><span></span><span></span><span></span></div>
+            Correcting…
+          </div>
+          <div id="corr-scope-badge" style="display:none;font-size:11px;opacity:0.75"></div>
+          <div style="flex:1"></div>
+          <div style="display:flex;gap:6px;align-items:center">
+            <select id="corr-scope-2" class="copy-btn" style="cursor:pointer" title="Scope"></select>
+            <button class="copy-btn" id="btn-corr-apply" title="Back up the folder, then apply these corrections to your files" style="display:none;background:var(--vscode-button-background);color:var(--vscode-button-foreground)" disabled>🔧 Apply to code</button>
+            <button class="copy-btn" id="btn-corr-regenerate" title="Re-run the correction team">↻ Re-run</button>
+            <button class="copy-btn" id="btn-corr-save" title="Save as Markdown" disabled>⬇ Save .md</button>
+            <button class="copy-btn" id="btn-corr-copy" disabled>Copy</button>
+            <button class="copy-btn" id="btn-corr-stop" style="display:none">■ Stop</button>
+          </div>
+        </div>
+        <div id="corr-rendered" style="flex:1;overflow:auto"></div>
       </div>
     </div>
 
@@ -2529,12 +3306,43 @@ export class MigrationPanel {
 
 <script>
 const vscode = acquireVsCodeApi();
+const MERMAID_URI = "${mermaidUri}";
 
 // ─── State ────────────────────────────────────────────────────────────────────
 let planMarkdown = '';
 let analysisData = null;
 let isGenerating = false;
 let lastRepoUrl   = '';
+
+// ─── Agent team state ─────────────────────────────────────────────────────────
+let teamMode = false;            // true while a multi-agent run is in progress
+let teamAgents = [];             // roster for the current run
+let agentBubbles = {};           // agentId -> { wrap, body, raw }
+let teamTranscriptHTML = '';     // saved discussion markup for the post-run toggle
+
+// ─── Architecture (LLD) state ─────────────────────────────────────────────────
+let archMarkdown = '';           // accumulated LLD document
+let archMode = false;            // true while the doc team is running
+let archAgents = [];             // doc team roster
+let archBubbles = {};            // agentId -> { wrap, body, raw }
+let archTranscriptHTML = '';     // saved discussion markup for the toggle
+let archGenerating = false;
+
+// ─── Security audit state ─────────────────────────────────────────────────────
+let secMarkdown = '';
+let secMode = false;
+let secAgents = [];
+let secBubbles = {};
+let secTranscriptHTML = '';
+let secGenerating = false;
+
+// ─── Correction state ─────────────────────────────────────────────────────────
+let corrMarkdown = '';
+let corrMode = false;
+let corrAgents = [];
+let corrBubbles = {};
+let corrTranscriptHTML = '';
+let corrGenerating = false;
 
 // ─── Render Scheduler ─────────────────────────────────────────────────────────
 // Throttle with leading + trailing fire.
@@ -2569,7 +3377,50 @@ function flushRender(key, fn) {
 
 // ─── Element Refs ──────────────────────────────────────────────────────────────
 const btnAnalyze       = document.getElementById('btn-analyze');
+const btnBrowseLocal   = document.getElementById('btn-browse-local');
+const localReposBox    = document.getElementById('local-repos');
+const localReposList   = document.getElementById('local-repos-list');
+const localRootLabel   = document.getElementById('local-root');
+const localSelectAll   = document.getElementById('local-select-all');
+const btnAnalyzeMulti  = document.getElementById('btn-analyze-multi');
 const btnGenerate      = document.getElementById('btn-generate');
+// Architecture tab
+const archEmpty        = document.getElementById('arch-empty');
+const archContainer    = document.getElementById('arch-container');
+const archRendered     = document.getElementById('arch-rendered');
+const btnGenerateArch  = document.getElementById('btn-generate-arch');
+const btnArchSave      = document.getElementById('btn-arch-save');
+const btnArchCopy      = document.getElementById('btn-arch-copy');
+const btnArchStop      = document.getElementById('btn-arch-stop');
+const btnArchRegen     = document.getElementById('btn-arch-regenerate');
+const archGenIndicator = document.getElementById('arch-gen-indicator');
+// Security tab
+const secEmpty         = document.getElementById('sec-empty');
+const secContainer     = document.getElementById('sec-container');
+const secRendered      = document.getElementById('sec-rendered');
+const secSummary       = document.getElementById('sec-summary');
+const btnGenerateSec   = document.getElementById('btn-generate-sec');
+const btnSecSave       = document.getElementById('btn-sec-save');
+const btnSecCopy       = document.getElementById('btn-sec-copy');
+const btnSecStop       = document.getElementById('btn-sec-stop');
+const btnSecRegen      = document.getElementById('btn-sec-regenerate');
+const secGenIndicator  = document.getElementById('sec-gen-indicator');
+// Correction tab
+const corrEmpty        = document.getElementById('corr-empty');
+const corrContainer    = document.getElementById('corr-container');
+const corrRendered     = document.getElementById('corr-rendered');
+const corrScope        = document.getElementById('corr-scope');
+const corrScope2       = document.getElementById('corr-scope-2');
+const corrScopeBadge   = document.getElementById('corr-scope-badge');
+const btnGenerateCorr  = document.getElementById('btn-generate-corr');
+const btnCorrSave      = document.getElementById('btn-corr-save');
+const btnCorrCopy      = document.getElementById('btn-corr-copy');
+const btnCorrStop      = document.getElementById('btn-corr-stop');
+const btnCorrRegen     = document.getElementById('btn-corr-regenerate');
+const btnCorrApply     = document.getElementById('btn-corr-apply');
+const corrGenIndicator = document.getElementById('corr-gen-indicator');
+let corrCanApply = false;   // true when the analysis is local (writable on disk)
+let corrApplying = false;
 const btnStop          = document.getElementById('btn-stop');
 const btnSuggest       = document.getElementById('btn-suggest');
 const recsSection      = document.getElementById('recs-section');
@@ -2718,14 +3569,40 @@ btnDismissStackChange.addEventListener('click', () => {
   stackChangeBanner.style.display = 'none';
 });
 
-// ─── Tab switching ─────────────────────────────────────────────────────────────
+// ─── Tab switching (with grouped dropdowns) ─────────────────────────────────────
+function closeTabMenus() {
+  document.querySelectorAll('.tab-group.open').forEach(g => g.classList.remove('open'));
+}
+// Highlight a group trigger when one of its items is the active tab.
+function syncGroupTriggers() {
+  document.querySelectorAll('.tab-group').forEach(g => {
+    const trigger = g.querySelector('.tab-group-trigger');
+    if (trigger) { trigger.classList.toggle('has-active', !!g.querySelector('.tab.active')); }
+  });
+}
 document.querySelectorAll('.tab').forEach(tab => {
   tab.addEventListener('click', () => {
     document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
     document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
     tab.classList.add('active');
     document.getElementById('tab-' + tab.dataset.tab).classList.add('active');
+    closeTabMenus();
+    syncGroupTriggers();
   });
+});
+// Dropdown triggers open/close their menu
+document.querySelectorAll('.tab-group-trigger').forEach(trigger => {
+  trigger.addEventListener('click', (e) => {
+    e.stopPropagation();
+    const group = trigger.closest('.tab-group');
+    const wasOpen = group.classList.contains('open');
+    closeTabMenus();
+    if (!wasOpen) { group.classList.add('open'); }
+  });
+});
+// Click outside closes any open menu
+document.addEventListener('click', (e) => {
+  if (!e.target.closest('.tab-group')) { closeTabMenus(); }
 });
 
 // ─── Chat ──────────────────────────────────────────────────────────────────────
@@ -2921,6 +3798,53 @@ btnAnalyze.addEventListener('click', () => {
   vscode.postMessage({ type: 'analyze', repoUrl, githubToken: inputToken.value.trim() || undefined });
 });
 
+// ─── Browse Local Folder ────────────────────────────────────────────────────────
+btnBrowseLocal.addEventListener('click', () => {
+  hideError();
+  vscode.postMessage({ type: 'browseLocalFolder' });
+});
+
+function analyzeLocalRepo(path, name) {
+  hideError();
+  cacheNotice.style.display = 'none';
+  progressSect.style.display = 'block';
+  progressBar.style.width = '0%';
+  progressText.textContent = 'Analyzing ' + name + '…';
+  stackSection.style.display = 'none';
+  btnGenerate.disabled = true;
+  lastRepoUrl = 'local:' + path;
+  vscode.postMessage({ type: 'analyzeLocal', localPath: path });
+}
+
+function updateMultiBtn() {
+  const n = localReposList.querySelectorAll('.local-repo-cb:checked').length;
+  btnAnalyzeMulti.disabled = n < 1;
+  btnAnalyzeMulti.textContent = n > 1
+    ? '🔗 Analyze ' + n + ' repos together'
+    : (n === 1 ? '🔗 Analyze 1 selected' : '🔗 Analyze selected together');
+}
+
+localSelectAll.addEventListener('change', () => {
+  localReposList.querySelectorAll('.local-repo-cb').forEach((cb) => { cb.checked = localSelectAll.checked; });
+  updateMultiBtn();
+});
+
+btnAnalyzeMulti.addEventListener('click', () => {
+  const checked = Array.from(localReposList.querySelectorAll('.local-repo-cb:checked'));
+  const paths = checked.map((c) => c.dataset.path);
+  if (paths.length === 0) { return; }
+  if (paths.length === 1) { analyzeLocalRepo(paths[0], checked[0].dataset.name); return; }
+  hideError();
+  cacheNotice.style.display = 'none';
+  progressSect.style.display = 'block';
+  progressBar.style.width = '0%';
+  progressText.textContent = 'Analyzing ' + paths.length + ' repositories together…';
+  stackSection.style.display = 'none';
+  btnGenerate.disabled = true;
+  lastRepoUrl = 'local-multi:' + paths.length;
+  vscode.postMessage({ type: 'analyzeLocalMulti', localPaths: paths });
+});
+
 // ─── Stack Health ─────────────────────────────────────────────────────────────
 btnHealth.addEventListener('click', () => {
   hideError();
@@ -2955,6 +3879,152 @@ btnGenerate.addEventListener('click', () => {
 
 btnStop.addEventListener('click', () => vscode.postMessage({ type: 'stopGeneration' }));
 
+// ─── Architecture (LLD) actions ───────────────────────────────────────────────
+function startArchGeneration() {
+  archGenerating = true;
+  archMode = false;
+  archMarkdown = '';
+  archTranscriptHTML = '';
+  var oldBtn = document.getElementById('btn-arch-discussion');
+  if (oldBtn) { oldBtn.remove(); }
+  archEmpty.style.display = 'none';
+  archContainer.style.display = 'flex';
+  archGenIndicator.style.display = 'flex';
+  btnArchStop.style.display = 'inline-flex';
+  btnGenerateArch.disabled = true;
+  btnArchRegen.disabled = true;
+  btnArchSave.disabled = true;
+  btnArchCopy.disabled = true;
+  renderArchProgressUI('Preparing the documentation team…');
+}
+function stopArchGeneration() {
+  archGenerating = false;
+  archGenIndicator.style.display = 'none';
+  btnArchStop.style.display = 'none';
+  btnGenerateArch.disabled = false;
+  btnArchRegen.disabled = false;
+}
+function requestArchitecture() {
+  if (!analysisData) { showError('Please analyze a repository first.'); return; }
+  hideError();
+  startArchGeneration();
+  vscode.postMessage({ type: 'generateArchitecture' });
+}
+btnGenerateArch.addEventListener('click', requestArchitecture);
+btnArchRegen.addEventListener('click', requestArchitecture);
+btnArchStop.addEventListener('click', () => vscode.postMessage({ type: 'stopGeneration' }));
+btnArchSave.addEventListener('click', () => vscode.postMessage({ type: 'saveArchitecture' }));
+btnArchCopy.addEventListener('click', () => {
+  navigator.clipboard.writeText(archMarkdown).then(() => {
+    btnArchCopy.textContent = 'Copied!';
+    setTimeout(() => { btnArchCopy.textContent = 'Copy'; }, 1500);
+  });
+});
+
+// ─── Security audit actions ───────────────────────────────────────────────────
+function startSecGeneration() {
+  secGenerating = true;
+  secMode = false;
+  secMarkdown = '';
+  secTranscriptHTML = '';
+  var oldBtn = document.getElementById('btn-sec-discussion');
+  if (oldBtn) { oldBtn.remove(); }
+  secEmpty.style.display = 'none';
+  secContainer.style.display = 'flex';
+  secGenIndicator.style.display = 'flex';
+  secSummary.style.display = 'none';
+  secSummary.innerHTML = '';
+  btnSecStop.style.display = 'inline-flex';
+  btnGenerateSec.disabled = true;
+  btnSecRegen.disabled = true;
+  btnSecSave.disabled = true;
+  btnSecCopy.disabled = true;
+  renderSecProgressUI('Preparing the security team…');
+}
+function stopSecGeneration() {
+  secGenerating = false;
+  secGenIndicator.style.display = 'none';
+  btnSecStop.style.display = 'none';
+  btnGenerateSec.disabled = false;
+  btnSecRegen.disabled = false;
+}
+function requestSecurity() {
+  if (!analysisData) { showError('Please analyze a repository first.'); return; }
+  hideError();
+  startSecGeneration();
+  vscode.postMessage({ type: 'generateSecurity' });
+}
+btnGenerateSec.addEventListener('click', requestSecurity);
+btnSecRegen.addEventListener('click', requestSecurity);
+btnSecStop.addEventListener('click', () => vscode.postMessage({ type: 'stopGeneration' }));
+btnSecSave.addEventListener('click', () => vscode.postMessage({ type: 'saveSecurity' }));
+btnSecCopy.addEventListener('click', () => {
+  navigator.clipboard.writeText(secMarkdown).then(() => {
+    btnSecCopy.textContent = 'Copied!';
+    setTimeout(() => { btnSecCopy.textContent = 'Copy'; }, 1500);
+  });
+});
+
+// ─── Correction actions ───────────────────────────────────────────────────────
+function startCorrGeneration() {
+  corrGenerating = true;
+  corrMode = false;
+  corrMarkdown = '';
+  corrTranscriptHTML = '';
+  var oldBtn = document.getElementById('btn-corr-discussion');
+  if (oldBtn) { oldBtn.remove(); }
+  corrEmpty.style.display = 'none';
+  corrContainer.style.display = 'flex';
+  corrGenIndicator.style.display = 'flex';
+  btnCorrStop.style.display = 'inline-flex';
+  btnGenerateCorr.disabled = true;
+  btnCorrRegen.disabled = true;
+  btnCorrSave.disabled = true;
+  btnCorrCopy.disabled = true;
+  renderCorrProgressUI('Assembling the correction team…');
+}
+function stopCorrGeneration() {
+  corrGenerating = false;
+  corrGenIndicator.style.display = 'none';
+  btnCorrStop.style.display = 'none';
+  btnGenerateCorr.disabled = false;
+  btnCorrRegen.disabled = false;
+}
+function requestCorrection(scopeRepo) {
+  if (!analysisData) { showError('Please analyze a repository or folder first.'); return; }
+  hideError();
+  const scope = scopeRepo || '';
+  corrScope.value = scope;
+  corrScope2.value = scope;
+  corrScopeBadge.textContent = scope ? '🔒 Scope: ' + scope : '🔒 Scope: whole project';
+  corrScopeBadge.style.display = 'inline';
+  startCorrGeneration();
+  vscode.postMessage({ type: 'generateCorrection', scopeRepo: scope || undefined });
+}
+btnGenerateCorr.addEventListener('click', () => requestCorrection(corrScope.value));
+btnCorrRegen.addEventListener('click', () => requestCorrection(corrScope2.value));
+corrScope2.addEventListener('change', () => { corrScope.value = corrScope2.value; });
+btnCorrStop.addEventListener('click', () => vscode.postMessage({ type: 'stopGeneration' }));
+btnCorrApply.addEventListener('click', () => {
+  if (!corrCanApply) {
+    showError('Apply works only on locally-analyzed folders. Use 📁 Browse Local Folder.');
+    return;
+  }
+  if (!corrMarkdown) { showError('Generate a correction plan first.'); return; }
+  corrApplying = true;
+  btnCorrApply.disabled = true;
+  btnCorrApply.textContent = '⏳ Backing up & applying…';
+  corrGenIndicator.style.display = 'flex';
+  vscode.postMessage({ type: 'applyCorrection', scopeRepo: corrScope2.value || undefined });
+});
+btnCorrSave.addEventListener('click', () => vscode.postMessage({ type: 'saveCorrection' }));
+btnCorrCopy.addEventListener('click', () => {
+  navigator.clipboard.writeText(corrMarkdown).then(() => {
+    btnCorrCopy.textContent = 'Copied!';
+    setTimeout(() => { btnCorrCopy.textContent = 'Copy'; }, 1500);
+  });
+});
+
 btnCopy.addEventListener('click', () => {
   navigator.clipboard.writeText(planMarkdown).then(() => {
     btnCopy.textContent = 'Copied!';
@@ -2988,6 +4058,7 @@ btnPreviews.addEventListener('click', () => {
   document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
   document.querySelector('[data-tab="previews"]').classList.add('active');
   document.getElementById('tab-previews').classList.add('active');
+  syncGroupTriggers();
 });
 
 btnCopyPreviews.addEventListener('click', () => {
@@ -3167,6 +4238,11 @@ window.addEventListener('message', (event) => {
       renderSecurityReport(msg.analysis);
       btnGenerate.disabled = false;
       btnSuggest.disabled = false;
+      btnGenerateArch.disabled = false;
+      btnGenerateSec.disabled = false;
+      btnGenerateCorr.disabled = false;
+      corrCanApply = msg.canApply === true;
+      populateCorrScope(msg.analysis);
       btnRunQueue.disabled = !inputTarget.value.trim() || !queueInput.value.trim();
       // Show preset loading spinner while AI generates options in background
       presetLoading.style.display = 'inline-flex';
@@ -3180,6 +4256,47 @@ window.addEventListener('message', (event) => {
       const ago = Math.round((Date.now() - msg.cachedAt) / 60000);
       cacheNotice.style.display = 'block';
       cacheNotice.querySelector('span') && (cacheNotice.querySelector('span').textContent = \`\${ago}m ago\`);
+      break;
+    }
+
+    case 'localReposFound': {
+      const repos = msg.localRepos || [];
+      localRootLabel.textContent = msg.localRoot ? '— ' + msg.localRoot : '';
+      localReposList.innerHTML = '';
+      // When several repos are found, pre-select them all so "Analyze together"
+      // (which is what enables per-repo scope in Correct) is the obvious default.
+      const preselect = repos.length > 1;
+      localSelectAll.checked = preselect;
+      repos.forEach((r) => {
+        const row = document.createElement('div');
+        row.style.cssText = 'display:flex;align-items:center;gap:6px';
+        const cb = document.createElement('input');
+        cb.type = 'checkbox';
+        cb.className = 'local-repo-cb';
+        cb.checked = preselect;
+        cb.dataset.path = r.path;
+        cb.dataset.name = r.name;
+        cb.addEventListener('change', updateMultiBtn);
+        const btn = document.createElement('button');
+        btn.className = 'copy-btn';
+        btn.style.cssText = 'flex:1;text-align:left;display:flex;justify-content:space-between;gap:8px;align-items:center;padding:6px 8px';
+        btn.title = 'Analyze ' + r.name + ' — ' + r.path;
+        const nameSpan = document.createElement('span');
+        nameSpan.textContent = '📦 ' + r.name;
+        nameSpan.style.cssText = 'overflow:hidden;text-overflow:ellipsis;white-space:nowrap';
+        const markSpan = document.createElement('span');
+        markSpan.textContent = r.marker;
+        markSpan.style.cssText = 'opacity:0.55;font-size:10px;flex-shrink:0';
+        btn.appendChild(nameSpan);
+        btn.appendChild(markSpan);
+        btn.addEventListener('click', () => analyzeLocalRepo(r.path, r.name));
+        row.appendChild(cb);
+        row.appendChild(btn);
+        localReposList.appendChild(row);
+      });
+      localReposBox.style.display = repos.length ? 'block' : 'none';
+      btnAnalyzeMulti.style.display = repos.length ? 'block' : 'none';
+      updateMultiBtn();
       break;
     }
 
@@ -3219,29 +4336,339 @@ window.addEventListener('message', (event) => {
         clearPlanDOM();
         planOutput.textContent = '';
         showPlanContainer();
+        // Reset team state — a multi-agent run announces itself via 'teamFormed'
+        // (which arrives right after this clear) and switches to the team UI.
+        teamMode = false;
+        teamTranscriptHTML = '';
+        var _oldTeamBtn = document.getElementById('btn-team-discussion');
+        if (_oldTeamBtn) { _oldTeamBtn.remove(); }
+        // Progress card until either the team is assembled ('teamFormed') or the
+        // plan arrives. Parsing partial markdown live is fragile, so the plan is
+        // rendered once at completion.
+        _planProgress = { current: 0, total: 0, heading: '', phase: 'Preparing the migration plan…' };
+        renderPlanProgressUI();
       } else {
         planMarkdown += msg.chunk;
         rawEmpty.style.display = 'none';
         planOutput.style.display = 'block';
-        // Incremental render: only the tail section is re-parsed each tick.
-        // All previously completed sections stay frozen in the DOM.
-        scheduleRender('plan', () => {
-          renderPlanIncremental(false);
-          planOutput.textContent = planMarkdown;
-          if (planRendered.scrollHeight - planRendered.scrollTop - planRendered.clientHeight < 200) {
-            planRendered.scrollTop = planRendered.scrollHeight;
-          }
-        });
+        // Keep the raw-text view current (plain text is cheap + safe), but never
+        // render markdown incrementally — progress is shown instead.
+        planOutput.textContent = planMarkdown;
+        var _isCoherence = msg.chunk.indexOf('Plan Coherence Review') !== -1;
+        if (teamMode) {
+          if (_isCoherence) { updateSynthesisProgress('Reviewing the plan for coherence…', 95); }
+        } else if (_isCoherence) {
+          _planProgress.phase = 'Reviewing plan for coherence…';
+          renderPlanProgressUI();
+        }
       }
       break;
 
+    case 'teamFormed':
+      setupTeamUI(msg.agents || []);
+      break;
+
+    case 'agentMessageStart':
+      if (!teamMode) { setupTeamUI(teamAgents); }
+      addAgentBubble(msg.agentId, msg.agentRole, msg.agentEmoji, msg.agentPhase);
+      break;
+
+    case 'agentMessageChunk':
+      appendAgentChunk(msg.agentId, msg.chunk || '');
+      break;
+
+    case 'agentMessageEnd':
+      finishAgentBubble(msg.agentId);
+      break;
+
+    // ── Architecture (LLD) ──
+    case 'archChunk':
+      if (msg.chunk === '') {
+        archMarkdown = '';
+        renderArchProgressUI('Preparing the documentation team…');
+      } else {
+        archMarkdown += msg.chunk;
+        if (archMode && msg.chunk.indexOf('Glossary & Onboarding') !== -1) {
+          updateArchSynthProgress('Finishing up…', 98);
+        }
+      }
+      break;
+
+    case 'archTeamFormed':
+      setupArchUI(msg.agents || []);
+      break;
+
+    case 'archAgentMessageStart':
+      if (!archMode) { setupArchUI(archAgents); }
+      addArchBubble(msg.agentId, msg.agentRole, msg.agentEmoji, msg.agentPhase);
+      break;
+
+    case 'archAgentMessageChunk':
+      appendArchChunk(msg.agentId, msg.chunk || '');
+      break;
+
+    case 'archAgentMessageEnd':
+      finishArchBubble(msg.agentId);
+      break;
+
+    case 'archSectionProgress': {
+      const aIdx = (msg.sectionIndex ?? 0) + 1;
+      const aTotal = msg.sectionTotal ?? 1;
+      const aPct = Math.round((aIdx / aTotal) * 95);
+      const aHeading = (msg.sectionHeading ?? '').replace(/^##+ ?\d+\.?\s*/, '');
+      if (archMode) {
+        updateArchSynthProgress(\`Writing section \${aIdx} of \${aTotal}: \${aHeading}\`, aPct);
+      } else {
+        renderArchProgressUI(\`Writing section \${aIdx} of \${aTotal}: \${aHeading}\`);
+      }
+      break;
+    }
+
+    case 'archComplete':
+      if (archMode) {
+        var aSp = archRendered.querySelector('.synthesis-progress');
+        if (aSp) { aSp.remove(); }
+        var aRoster = archRendered.querySelector('.team-roster');
+        var aDisc = document.getElementById('arch-discussion');
+        archTranscriptHTML = (aRoster ? aRoster.outerHTML : '') + (aDisc ? aDisc.outerHTML : '');
+      }
+      renderArchFull();
+      stopArchGeneration();
+      if (archMode) { installArchTranscriptToggle(); archMode = false; }
+      btnArchSave.disabled = !archMarkdown;
+      btnArchCopy.disabled = !archMarkdown;
+      if (msg.failedSections && msg.failedSections.length > 0) {
+        const warn = document.createElement('div');
+        warn.style.cssText = 'padding:10px 14px;margin-bottom:12px;border-radius:6px;background:var(--vscode-inputValidation-warningBackground,#5a4a00);border:1px solid var(--vscode-inputValidation-warningBorder,#b89500);font-size:13px';
+        warn.textContent = '⚠️ ' + msg.failedSections.length + ' section(s) could not be generated. Try Regenerate.';
+        archRendered.insertBefore(warn, archRendered.firstChild);
+      }
+      break;
+
+    case 'archError':
+      stopArchGeneration();
+      archContainer.style.display = 'none';
+      archEmpty.style.display = 'flex';
+      showError(msg.message || 'Architecture generation failed.');
+      break;
+
+    case 'architectureSaved':
+      btnArchSave.title = 'Saved!';
+      setTimeout(() => { btnArchSave.title = 'Save as Markdown'; }, 2000);
+      break;
+
+    // ── Security audit ──
+    case 'secChunk':
+      if (msg.chunk === '') {
+        secMarkdown = '';
+        renderSecProgressUI('Preparing the security team…');
+      } else {
+        secMarkdown += msg.chunk;
+        if (secMode && msg.chunk.indexOf('Remediation Roadmap') !== -1) {
+          updateSecSynthProgress('Finishing the remediation roadmap…', 98);
+        }
+      }
+      break;
+
+    case 'secTeamFormed':
+      setupSecUI(msg.agents || []);
+      break;
+
+    case 'secAgentMessageStart':
+      if (!secMode) { setupSecUI(secAgents); }
+      addSecBubble(msg.agentId, msg.agentRole, msg.agentEmoji, msg.agentPhase);
+      break;
+
+    case 'secAgentMessageChunk':
+      appendSecChunk(msg.agentId, msg.chunk || '');
+      break;
+
+    case 'secAgentMessageEnd':
+      finishSecBubble(msg.agentId);
+      break;
+
+    case 'secSectionProgress': {
+      const sIdx = (msg.sectionIndex ?? 0) + 1;
+      const sTotal = msg.sectionTotal ?? 1;
+      const sPct = Math.round((sIdx / sTotal) * 95);
+      const sHeading = (msg.sectionHeading ?? '').replace(/^#+ */, '');
+      if (secMode) {
+        updateSecSynthProgress(\`Writing: \${sHeading}\`, sPct);
+      } else {
+        renderSecProgressUI(\`Writing: \${sHeading}\`);
+      }
+      break;
+    }
+
+    case 'secComplete':
+      if (secMode) {
+        var sSp = secRendered.querySelector('.synthesis-progress');
+        if (sSp) { sSp.remove(); }
+        var sRoster = secRendered.querySelector('.team-roster');
+        var sDisc = document.getElementById('sec-discussion');
+        secTranscriptHTML = (sRoster ? sRoster.outerHTML : '') + (sDisc ? sDisc.outerHTML : '');
+      }
+      renderSecFull();
+      renderSecSummary();
+      stopSecGeneration();
+      if (secMode) { installSecTranscriptToggle(); secMode = false; }
+      btnSecSave.disabled = !secMarkdown;
+      btnSecCopy.disabled = !secMarkdown;
+      if (msg.failedSections && msg.failedSections.length > 0) {
+        const sWarn = document.createElement('div');
+        sWarn.style.cssText = 'padding:10px 14px;margin-bottom:12px;border-radius:6px;background:var(--vscode-inputValidation-warningBackground,#5a4a00);border:1px solid var(--vscode-inputValidation-warningBorder,#b89500);font-size:13px';
+        sWarn.textContent = '⚠️ ' + msg.failedSections.length + ' section(s) could not be generated. Try Re-run.';
+        secRendered.insertBefore(sWarn, secRendered.firstChild);
+      }
+      break;
+
+    case 'secError':
+      stopSecGeneration();
+      secContainer.style.display = 'none';
+      secEmpty.style.display = 'flex';
+      showError(msg.message || 'Security audit failed.');
+      break;
+
+    case 'securitySaved':
+      btnSecSave.title = 'Saved!';
+      setTimeout(() => { btnSecSave.title = 'Save as Markdown'; }, 2000);
+      break;
+
+    // ── Behavior-preserving correction ──
+    case 'corrChunk':
+      if (msg.chunk === '') {
+        corrMarkdown = '';
+        renderCorrProgressUI('Assembling the correction team…');
+      } else {
+        corrMarkdown += msg.chunk;
+        if (corrMode && msg.chunk.indexOf('Rollback & Safety Net') !== -1) {
+          updateCorrSynthProgress('Finalising the safety net…', 98);
+        }
+      }
+      break;
+
+    case 'corrTeamFormed':
+      setupCorrUI(msg.agents || []);
+      break;
+
+    case 'corrAgentMessageStart':
+      if (!corrMode) { setupCorrUI(corrAgents); }
+      addCorrBubble(msg.agentId, msg.agentRole, msg.agentEmoji, msg.agentPhase);
+      break;
+
+    case 'corrAgentMessageChunk':
+      appendCorrChunk(msg.agentId, msg.chunk || '');
+      break;
+
+    case 'corrAgentMessageEnd':
+      finishCorrBubble(msg.agentId);
+      break;
+
+    case 'corrSectionProgress': {
+      const cIdx = (msg.sectionIndex ?? 0) + 1;
+      const cTotal = msg.sectionTotal ?? 1;
+      const cPct = Math.round((cIdx / cTotal) * 95);
+      const cHeading = (msg.sectionHeading ?? '').replace(/^#+ */, '');
+      if (corrMode) {
+        updateCorrSynthProgress(\`Writing: \${cHeading}\`, cPct);
+      } else {
+        renderCorrProgressUI(\`Writing: \${cHeading}\`);
+      }
+      break;
+    }
+
+    case 'corrComplete':
+      if (corrMode) {
+        var cSp = corrRendered.querySelector('.synthesis-progress');
+        if (cSp) { cSp.remove(); }
+        var cRoster = corrRendered.querySelector('.team-roster');
+        var cDisc = document.getElementById('corr-discussion');
+        corrTranscriptHTML = (cRoster ? cRoster.outerHTML : '') + (cDisc ? cDisc.outerHTML : '');
+      }
+      renderCorrFull();
+      stopCorrGeneration();
+      if (corrMode) { installCorrTranscriptToggle(); corrMode = false; }
+      btnCorrSave.disabled = !corrMarkdown;
+      btnCorrCopy.disabled = !corrMarkdown;
+      // Offer code-apply only for locally-analyzed folders
+      btnCorrApply.style.display = corrCanApply ? 'inline-flex' : 'none';
+      btnCorrApply.disabled = !corrMarkdown || !corrCanApply;
+      if (msg.failedSections && msg.failedSections.length > 0) {
+        const cWarn = document.createElement('div');
+        cWarn.style.cssText = 'padding:10px 14px;margin-bottom:12px;border-radius:6px;background:var(--vscode-inputValidation-warningBackground,#5a4a00);border:1px solid var(--vscode-inputValidation-warningBorder,#b89500);font-size:13px';
+        cWarn.textContent = '⚠️ ' + msg.failedSections.length + ' section(s) could not be generated. Try Re-run.';
+        corrRendered.insertBefore(cWarn, corrRendered.firstChild);
+      }
+      break;
+
+    case 'corrError':
+      stopCorrGeneration();
+      corrContainer.style.display = 'none';
+      corrEmpty.style.display = 'flex';
+      showError(msg.message || 'Correction plan failed.');
+      break;
+
+    case 'correctionSaved':
+      btnCorrSave.title = 'Saved!';
+      setTimeout(() => { btnCorrSave.title = 'Save as Markdown'; }, 2000);
+      break;
+
+    // ── Apply corrections to code ──
+    case 'applyProgress':
+      progressSect.style.display = 'block';
+      progressBar.style.width = '50%';
+      progressText.textContent = msg.message || 'Applying…';
+      corrGenIndicator.style.display = 'flex';
+      break;
+
+    case 'applyComplete': {
+      corrApplying = false;
+      corrGenIndicator.style.display = 'none';
+      progressSect.style.display = 'none';
+      btnCorrApply.disabled = false;
+      btnCorrApply.textContent = '🔧 Apply to code';
+      const files = msg.appliedFiles || [];
+      const backups = msg.backupPaths || [];
+      const banner = document.createElement('div');
+      banner.style.cssText = 'padding:12px 14px;margin-bottom:12px;border-radius:6px;background:var(--vscode-inputValidation-infoBackground,#1e3a4a);border:1px solid var(--vscode-inputValidation-infoBorder,#2196f3);font-size:13px';
+      banner.innerHTML =
+        '<div style="font-weight:600;margin-bottom:6px">' +
+          (files.length ? '✅ Applied ' + files.length + ' file change(s)' : 'ℹ️ No files were changed (nothing safe to apply)') +
+        '</div>' +
+        (backups.length ? '<div style="opacity:0.85">🗂 Backup: ' + backups.map(escapeHtml).join('<br>') + '</div>' : '') +
+        (files.length ? '<div style="margin-top:6px">' + files.slice(0, 50).map(escapeHtml).join('<br>') + '</div>' : '') +
+        '<div style="margin-top:8px;font-weight:600">⚠️ Review the diff (git) and run your tests to confirm behavior is unchanged.</div>';
+      corrRendered.insertBefore(banner, corrRendered.firstChild);
+      corrRendered.scrollTop = 0;
+      break;
+    }
+
+    case 'applyError':
+      corrApplying = false;
+      corrGenIndicator.style.display = 'none';
+      progressSect.style.display = 'none';
+      btnCorrApply.disabled = false;
+      btnCorrApply.textContent = '🔧 Apply to code';
+      showError(msg.message || 'Apply failed.');
+      break;
+
     case 'planComplete':
+      if (teamMode) {
+        // Preserve the live discussion (roster + bubbles) for the toggle, then
+        // drop the in-progress synthesis bar before the plan replaces it all.
+        var _sp = document.getElementById('synthesis-progress');
+        if (_sp) { _sp.remove(); }
+        var _roster = planRendered.querySelector('.team-roster');
+        var _disc = document.getElementById('team-discussion');
+        teamTranscriptHTML = (_roster ? _roster.outerHTML : '') + (_disc ? _disc.outerHTML : '');
+      }
       flushRender('plan', () => {
         // Full re-render with highlighting now that streaming is done.
         // Sections were frozen during streaming without highlight to avoid blocking.
         renderPlanFull();
         planOutput.textContent = planMarkdown;
       });
+      if (teamMode) { installTeamTranscriptToggle(); teamMode = false; }
       stopGeneration(false);
       btnSaveMd.disabled = false;
       btnPreviews.disabled = false;
@@ -3359,14 +4786,23 @@ window.addEventListener('message', (event) => {
     }
 
     case 'sectionProgress': {
-      // Update the progress bar only — the throttled scheduleRender in planChunk
-      // already keeps the formatted view up to date at the right pace
+      // Drive the in-plan progress card — the formatted plan is rendered once at
+      // planComplete, so this is the only live feedback while the plan streams.
       const idx   = (msg.sectionIndex ?? 0) + 1;
       const total = msg.sectionTotal ?? 1;
       const pct   = Math.round((idx / total) * 90);
       progressBar.style.width = pct + '%';
       const shortHeading = (msg.sectionHeading ?? '').replace(/^##+ ?\d+\.?\s*/, '');
       progressText.textContent = \`Generating section \${idx} of \${total}: \${shortHeading}\`;
+      if (teamMode) {
+        updateSynthesisProgress(\`Writing section \${idx} of \${total}: \${shortHeading}\`, pct);
+      } else {
+        _planProgress.current = idx;
+        _planProgress.total = total;
+        _planProgress.heading = shortHeading;
+        _planProgress.phase = 'Generating migration plan…';
+        renderPlanProgressUI();
+      }
       break;
     }
 
@@ -3377,6 +4813,37 @@ window.addEventListener('message', (event) => {
 
     case 'stopped':
       stopGeneration(true);
+      if (archGenerating) {
+        stopArchGeneration();
+        if (!archMarkdown) {
+          archContainer.style.display = 'none';
+          archEmpty.style.display = 'flex';
+        } else {
+          renderArchFull();
+        }
+        archMode = false;
+      }
+      if (secGenerating) {
+        stopSecGeneration();
+        if (!secMarkdown) {
+          secContainer.style.display = 'none';
+          secEmpty.style.display = 'flex';
+        } else {
+          renderSecFull();
+          renderSecSummary();
+        }
+        secMode = false;
+      }
+      if (corrGenerating) {
+        stopCorrGeneration();
+        if (!corrMarkdown) {
+          corrContainer.style.display = 'none';
+          corrEmpty.style.display = 'flex';
+        } else {
+          renderCorrFull();
+        }
+        corrMode = false;
+      }
       break;
 
     case 'error':
@@ -3617,16 +5084,14 @@ window.addEventListener('message', (event) => {
         // Empty chunk = patch starting.
         flushRender('plan', () => {});
         planMarkdown = '';
-        clearPlanDOM(); // must clear DOM + counter together; resetting only the counter
-        // left stale div[data-ps=N] elements that caused ALL sections to be re-frozen
-        // (re-parsing and re-highlighting) on every 500ms tick during a patch.
+        clearPlanDOM();
+        // Show a progress card instead of live-rendering partial markdown; the
+        // patched plan is rendered once at planPatchComplete.
+        _planProgress = { current: 0, total: 0, heading: '', phase: 'Updating migration plan…' };
+        renderPlanProgressUI();
       } else {
         planMarkdown += msg.chunk;
-        scheduleRender('plan', () => {
-          renderPlanIncremental(false);
-          planOutput.textContent = planMarkdown;
-          planRendered.scrollTop = planRendered.scrollHeight;
-        });
+        planOutput.textContent = planMarkdown;
       }
       break;
 
@@ -3926,6 +5391,7 @@ function analyzeOrgRepo(fullName, hostname) {
   document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
   document.querySelector('[data-tab="plan"]').classList.add('active');
   document.getElementById('tab-plan').classList.add('active');
+  syncGroupTriggers();
   btnAnalyze.click();
 }
 
@@ -4090,6 +5556,80 @@ function copyCode(btn) {
   }
 }
 
+// \u2500\u2500\u2500 Mermaid diagram rendering (lazy-loaded, fully local \u2014 no data leaves) \u2500\u2500\u2500\u2500\u2500
+function _getMermaid() {
+  var ns = window.__esbuild_esm_mermaid_nm && window.__esbuild_esm_mermaid_nm.mermaid;
+  if (!ns) { return null; }
+  return ns.default || ns;
+}
+function toggleMermaidSrc(btn) {
+  var wrap = btn.closest('.mermaid-wrap');
+  if (!wrap) { return; }
+  var pre = wrap.querySelector('.mermaid-src');
+  if (pre) { pre.style.display = pre.style.display === 'none' ? 'block' : 'none'; }
+}
+// Load the bundled mermaid script on first use, then invoke cb().
+var _mermaidState = 0; // 0=unloaded, 1=loading, 2=ready, 3=failed
+var _mermaidQueue = [];
+function ensureMermaid(cb) {
+  if (_mermaidState === 2) { cb(true); return; }
+  if (_mermaidState === 3) { cb(false); return; }
+  _mermaidQueue.push(cb);
+  if (_mermaidState === 1) { return; }
+  if (!MERMAID_URI) { _mermaidState = 3; _mermaidQueue.forEach(function(f){ f(false); }); _mermaidQueue = []; return; }
+  _mermaidState = 1;
+  var s = document.createElement('script');
+  s.src = MERMAID_URI;
+  s.onload = function() {
+    var m = _getMermaid();
+    if (m) {
+      var dark = !window.matchMedia || window.matchMedia('(prefers-color-scheme: light)').matches !== true;
+      try { m.initialize({ startOnLoad: false, securityLevel: 'loose', theme: dark ? 'dark' : 'default' }); } catch (e) {}
+      _mermaidState = 2;
+    } else { _mermaidState = 3; }
+    _mermaidQueue.forEach(function(f){ f(_mermaidState === 2); }); _mermaidQueue = [];
+  };
+  s.onerror = function() { _mermaidState = 3; _mermaidQueue.forEach(function(f){ f(false); }); _mermaidQueue = []; };
+  document.head.appendChild(s);
+}
+// Render every un-rendered mermaid block inside a container.
+function renderMermaidIn(container) {
+  if (!container) { return; }
+  var blocks = container.querySelectorAll('.mermaid-wrap');
+  if (!blocks.length) { return; }
+  ensureMermaid(function(ok) {
+    if (!ok) {
+      // Loading failed \u2014 reveal the source so the diagram code is still useful.
+      blocks.forEach(function(b) {
+        var src = b.querySelector('.mermaid-src'); if (src) { src.style.display = 'block'; }
+        var t = b.querySelector('.mermaid-render'); if (t) { t.remove(); }
+      });
+      return;
+    }
+    var m = _getMermaid();
+    blocks.forEach(function(b, idx) {
+      if (b.dataset.rendered) { return; }
+      var srcEl = b.querySelector('.mermaid-src code');
+      var target = b.querySelector('.mermaid-render');
+      if (!srcEl || !target) { return; }
+      b.dataset.rendered = '1';
+      var code = srcEl.textContent || '';
+      var id = 'mmd-' + Date.now() + '-' + idx;
+      try {
+        Promise.resolve(m.render(id, code)).then(function(res) {
+          target.innerHTML = (res && res.svg) ? res.svg : '';
+        }).catch(function() {
+          target.remove();
+          var src = b.querySelector('.mermaid-src'); if (src) { src.style.display = 'block'; }
+        });
+      } catch (e) {
+        target.remove();
+        var src2 = b.querySelector('.mermaid-src'); if (src2) { src2.style.display = 'block'; }
+      }
+    });
+  });
+}
+
 // ─── Line-by-line Markdown Parser ────────────────────────────────────────────
 // noHighlight=true: skip syntax highlighting (used for the streaming tail so
 // highlight() is never called repeatedly on every 500 ms render tick — it is
@@ -4140,6 +5680,22 @@ function parseMarkdown(md, noHighlight) {
         codeAcc.push(lines[i]); i++;
       }
       var codeBody = codeAcc.join('\\n');
+      // Mermaid diagrams: emit a render target + hidden source (rendered later by
+      // renderMermaidIn). Only on a complete, non-streaming block so we never try
+      // to draw a half-written diagram.
+      if (lang === 'mermaid' && closingFound && !noHighlight) {
+        out.push(
+          '<div class="code-wrap mermaid-wrap">' +
+          '<div class="code-label">📊 mermaid diagram' +
+            '<button class="code-copy-btn" onclick="copyCode(this)">Copy</button>' +
+            '<button class="code-copy-btn" onclick="toggleMermaidSrc(this)">&lt;/&gt; Code</button>' +
+          '</div>' +
+          '<pre class="mermaid-src" style="display:none"><code>' + esc(codeBody) + '</code></pre>' +
+          '<div class="mermaid-render"><div class="mmd-pending">📊 Rendering diagram…</div></div>' +
+          '</div>'
+        );
+        continue;
+      }
       // Only highlight when the block is closed AND we are not in the streaming
       // tail pass (noHighlight=true). This ensures highlight() is called at most
       // once per code block — when the section is frozen — never on every tick.
@@ -4340,6 +5896,343 @@ function renderPlanFull() {
   planRendered.innerHTML = '';
   planRendered.appendChild(frag);
   _planFrozenCount = parts.length;
+  renderMermaidIn(planRendered);
+}
+
+// ─── Plan generation progress placeholder ─────────────────────────────────────
+// While a plan streams we show a progress card instead of rendering the partial
+// markdown. Incrementally parsing half-written sections is fragile and can break
+// the view, so renderPlanFull() renders the finished plan once at completion.
+var _planProgress = { current: 0, total: 0, heading: '', phase: 'Generating migration plan…' };
+function renderPlanProgressUI() {
+  var pct = _planProgress.total ? Math.round((_planProgress.current / _planProgress.total) * 100) : 0;
+  var counter = _planProgress.total
+    ? 'Section ' + _planProgress.current + ' of ' + _planProgress.total
+    : 'Starting…';
+  var heading = _planProgress.heading
+    ? '<div style="font-size:12px;opacity:0.7;margin-top:2px;max-width:440px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + escapeHtml(_planProgress.heading) + '</div>'
+    : '';
+  planRendered.innerHTML =
+    '<div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;gap:14px;text-align:center;padding:24px">' +
+      '<div class="dot-pulse"><span></span><span></span><span></span></div>' +
+      '<div style="font-size:14px;font-weight:600">' + escapeHtml(_planProgress.phase) + '</div>' +
+      '<div style="font-size:12px;opacity:0.8">' + counter + '</div>' +
+      heading +
+      '<div style="width:280px;max-width:80%;height:6px;border-radius:3px;background:var(--vscode-input-background,rgba(255,255,255,0.08));overflow:hidden;margin-top:6px">' +
+        '<div style="height:100%;width:' + pct + '%;background:var(--vscode-button-background,#0e639c);transition:width 0.3s ease"></div>' +
+      '</div>' +
+      '<div style="font-size:11px;opacity:0.55;margin-top:4px">The full plan will appear here when generation finishes.</div>' +
+    '</div>';
+}
+
+// ─── Agent team discussion UI (shared by Plan + Architecture) ─────────────────
+// While a multi-agent run is in progress we show the live team conversation in
+// the target tab. The finished output replaces it; the discussion is preserved
+// behind a toggle in the header.
+var _phaseLabel = { analysis: 'Analysis', discussion: 'Discussion', synthesis: 'Synthesis' };
+
+// ── Generic, reusable building blocks (operate on explicit elements/stores) ──
+function _rosterHTML(agents, title) {
+  var chips = (agents || []).map(function(a) {
+    return '<span class="team-chip"><span class="em">' + escapeHtml(a.emoji || '🧩') + '</span>' + escapeHtml(a.role) + '</span>';
+  }).join('');
+  return '<div class="team-roster"><div class="team-roster-title">' + title + '</div>' + chips + '</div>';
+}
+
+function _addBubble(threadEl, store, agentId, role, emoji, phase, scrollEl) {
+  if (!threadEl) { return; }
+  var wrap = document.createElement('div');
+  wrap.className = 'agent-msg';
+  var phaseCls = phase === 'synthesis' ? 'agent-phase synthesis' : 'agent-phase';
+  wrap.innerHTML =
+    '<div class="agent-avatar">' + escapeHtml(emoji || '🧩') + '</div>' +
+    '<div class="agent-body">' +
+      '<div class="agent-meta">' +
+        '<span class="agent-name">' + escapeHtml(role || agentId) + '</span>' +
+        '<span class="' + phaseCls + '">' + (_phaseLabel[phase] || phase) + '</span>' +
+      '</div>' +
+      '<div class="agent-text"></div>' +
+    '</div>';
+  threadEl.appendChild(wrap);
+  store[agentId] = { wrap: wrap, body: wrap.querySelector('.agent-text'), raw: '' };
+  _scrollNear(scrollEl);
+}
+
+function _bubbleChunk(store, agentId, chunk, scrollEl) {
+  var b = store[agentId];
+  if (!b) { return; }
+  b.raw += chunk;
+  // Plain text while streaming — safe and cheap; markdown is applied on end.
+  b.body.textContent = b.raw;
+  _scrollNear(scrollEl);
+}
+
+function _bubbleFinish(store, agentId, scrollEl) {
+  var b = store[agentId];
+  if (!b) { return; }
+  if (b.raw.trim()) { b.body.innerHTML = parseMarkdown(b.raw, true); }
+  _scrollNear(scrollEl);
+}
+
+function _ensureSynthBar(threadEl, defaultLabel) {
+  if (!threadEl) { return null; }
+  var sp = threadEl.querySelector('.synthesis-progress');
+  if (!sp) {
+    sp = document.createElement('div');
+    sp.className = 'synthesis-progress';
+    sp.innerHTML =
+      '<div class="sp-row"><div class="dot-pulse"><span></span><span></span><span></span></div>' +
+      '<span class="sp-label">' + defaultLabel + '</span></div>' +
+      '<div class="sp-bar"><div class="sp-fill"></div></div>';
+    threadEl.appendChild(sp);
+  }
+  return sp;
+}
+
+function _updateSynthBar(threadEl, defaultLabel, label, pct, scrollEl) {
+  var sp = _ensureSynthBar(threadEl, defaultLabel);
+  if (!sp) { return; }
+  if (label) { sp.querySelector('.sp-label').textContent = label; }
+  if (typeof pct === 'number') { sp.querySelector('.sp-fill').style.width = pct + '%'; }
+  _scrollNear(scrollEl);
+}
+
+function _scrollNear(el) {
+  if (el && el.scrollHeight - el.scrollTop - el.clientHeight < 240) {
+    el.scrollTop = el.scrollHeight;
+  }
+}
+
+function _installTranscriptToggle(cfg) {
+  // cfg: { html, btnId, panelId, headerEl, renderedEl, label, beforeBtn }
+  if (!cfg.html) { return; }
+  if (!cfg.headerEl || document.getElementById(cfg.btnId)) { return; }
+  var btn = document.createElement('button');
+  btn.id = cfg.btnId;
+  btn.className = 'copy-btn';
+  btn.title = cfg.label;
+  btn.textContent = '💬 Team discussion';
+  btn.addEventListener('click', function() {
+    var existing = document.getElementById(cfg.panelId);
+    if (existing) { existing.remove(); btn.style.background = ''; return; }
+    var panel = document.createElement('div');
+    panel.id = cfg.panelId;
+    panel.style.cssText = 'margin-bottom:16px;padding:12px;border:1px solid var(--vscode-panel-border);border-radius:8px;background:var(--vscode-editor-inactiveSelectionBackground)';
+    panel.innerHTML = '<div style="font-weight:600;margin-bottom:10px">' + cfg.label + '</div>' + cfg.html;
+    cfg.renderedEl.insertBefore(panel, cfg.renderedEl.firstChild);
+    panel.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    btn.style.background = 'var(--vscode-button-secondaryBackground)';
+  });
+  var before = cfg.beforeBtn && cfg.beforeBtn.parentNode ? cfg.beforeBtn : null;
+  if (before) { before.parentNode.insertBefore(btn, before); }
+  else { cfg.headerEl.appendChild(btn); }
+}
+
+// ── Plan-tab wrappers ──
+function setupTeamUI(agents) {
+  teamMode = true;
+  teamAgents = agents || [];
+  agentBubbles = {};
+  planRendered.innerHTML =
+    _rosterHTML(teamAgents, '🤝 Migration team assembled — ' + teamAgents.length + ' members') +
+    '<div id="team-discussion"></div>';
+}
+function addAgentBubble(agentId, role, emoji, phase) {
+  _addBubble(document.getElementById('team-discussion'), agentBubbles, agentId, role, emoji, phase, planRendered);
+}
+function appendAgentChunk(agentId, chunk) { _bubbleChunk(agentBubbles, agentId, chunk, planRendered); }
+function finishAgentBubble(agentId) { _bubbleFinish(agentBubbles, agentId, planRendered); }
+function updateSynthesisProgress(label, pct) {
+  _updateSynthBar(document.getElementById('team-discussion'), 'Writing the migration plan…', label, pct, planRendered);
+}
+function installTeamTranscriptToggle() {
+  _installTranscriptToggle({
+    html: teamTranscriptHTML,
+    btnId: 'btn-team-discussion',
+    panelId: 'team-transcript-panel',
+    headerEl: document.querySelector('#tab-plan .plan-header'),
+    renderedEl: planRendered,
+    label: '💬 How the team built this plan',
+    beforeBtn: document.getElementById('btn-copy'),
+  });
+}
+
+// ── Architecture-tab wrappers ──
+function setupArchUI(agents) {
+  archMode = true;
+  archAgents = agents || [];
+  archBubbles = {};
+  archRendered.innerHTML =
+    _rosterHTML(archAgents, '🏛️ Engineering team assembled — ' + archAgents.length + ' members') +
+    '<div id="arch-discussion"></div>';
+}
+function addArchBubble(agentId, role, emoji, phase) {
+  _addBubble(document.getElementById('arch-discussion'), archBubbles, agentId, role, emoji, phase, archRendered);
+}
+function appendArchChunk(agentId, chunk) { _bubbleChunk(archBubbles, agentId, chunk, archRendered); }
+function finishArchBubble(agentId) { _bubbleFinish(archBubbles, agentId, archRendered); }
+function updateArchSynthProgress(label, pct) {
+  _updateSynthBar(document.getElementById('arch-discussion'), 'Writing the documentation…', label, pct, archRendered);
+}
+function installArchTranscriptToggle() {
+  _installTranscriptToggle({
+    html: archTranscriptHTML,
+    btnId: 'btn-arch-discussion',
+    panelId: 'arch-transcript-panel',
+    headerEl: document.querySelector('#tab-architecture .plan-header'),
+    renderedEl: archRendered,
+    label: '💬 How the team wrote this documentation',
+    beforeBtn: document.getElementById('btn-arch-copy'),
+  });
+}
+function renderArchProgressUI(phase) {
+  archRendered.innerHTML =
+    '<div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;gap:14px;text-align:center;padding:24px">' +
+      '<div class="dot-pulse"><span></span><span></span><span></span></div>' +
+      '<div style="font-size:14px;font-weight:600">' + escapeHtml(phase || 'Preparing…') + '</div>' +
+      '<div style="font-size:11px;opacity:0.55;margin-top:4px">The documentation will appear here when it is ready.</div>' +
+    '</div>';
+}
+function renderArchFull() {
+  if (!archMarkdown) { return; }
+  var parts = splitPlanSections(archMarkdown);
+  var frag = document.createDocumentFragment();
+  for (var i = 0; i < parts.length; i++) {
+    var d = document.createElement('div');
+    d.innerHTML = parseMarkdown(parts[i]);
+    frag.appendChild(d);
+  }
+  archRendered.innerHTML = '';
+  archRendered.appendChild(frag);
+  renderMermaidIn(archRendered);
+}
+
+// ── Security-tab wrappers ──
+function setupSecUI(agents) {
+  secMode = true;
+  secAgents = agents || [];
+  secBubbles = {};
+  secRendered.innerHTML =
+    _rosterHTML(secAgents, '🛡️ Security team assembled — ' + secAgents.length + ' members') +
+    '<div id="sec-discussion"></div>';
+}
+function addSecBubble(agentId, role, emoji, phase) {
+  _addBubble(document.getElementById('sec-discussion'), secBubbles, agentId, role, emoji, phase, secRendered);
+}
+function appendSecChunk(agentId, chunk) { _bubbleChunk(secBubbles, agentId, chunk, secRendered); }
+function finishSecBubble(agentId) { _bubbleFinish(secBubbles, agentId, secRendered); }
+function updateSecSynthProgress(label, pct) {
+  _updateSynthBar(document.getElementById('sec-discussion'), 'Writing the vulnerability report…', label, pct, secRendered);
+}
+function installSecTranscriptToggle() {
+  _installTranscriptToggle({
+    html: secTranscriptHTML,
+    btnId: 'btn-sec-discussion',
+    panelId: 'sec-transcript-panel',
+    headerEl: document.querySelector('#tab-security-audit .plan-header'),
+    renderedEl: secRendered,
+    label: '💬 How the team found these issues',
+    beforeBtn: document.getElementById('btn-sec-copy'),
+  });
+}
+function renderSecProgressUI(phase) {
+  secRendered.innerHTML =
+    '<div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;gap:14px;text-align:center;padding:24px">' +
+      '<div class="dot-pulse"><span></span><span></span><span></span></div>' +
+      '<div style="font-size:14px;font-weight:600">' + escapeHtml(phase || 'Preparing…') + '</div>' +
+      '<div style="font-size:11px;opacity:0.55;margin-top:4px">The severity-sorted report will appear here when it is ready.</div>' +
+    '</div>';
+}
+function renderSecFull() {
+  if (!secMarkdown) { return; }
+  var parts = splitPlanSections(secMarkdown);
+  var frag = document.createDocumentFragment();
+  for (var i = 0; i < parts.length; i++) {
+    var d = document.createElement('div');
+    d.innerHTML = parseMarkdown(parts[i]);
+    frag.appendChild(d);
+  }
+  secRendered.innerHTML = '';
+  secRendered.appendChild(frag);
+  renderMermaidIn(secRendered);
+}
+// Count findings by severity tag and show a colour-coded summary in the header.
+function renderSecSummary() {
+  var sevs = [
+    { key: 'critical', label: 'Critical', color: '#e53935' },
+    { key: 'high',     label: 'High',     color: '#fb8c00' },
+    { key: 'medium',   label: 'Medium',   color: '#fdd835' },
+    { key: 'low',      label: 'Low',      color: '#43a047' },
+  ];
+  var lower = secMarkdown.toLowerCase();
+  var total = 0;
+  var html = sevs.map(function(s) {
+    // Count literal "[critical]" etc. via split — avoids regex-escape pitfalls.
+    var n = lower.split('[' + s.key + ']').length - 1;
+    total += n;
+    return '<span class="team-chip" style="border:1px solid ' + s.color + '"><span class="em" style="color:' + s.color + '">●</span>' + s.label + ': ' + n + '</span>';
+  }).join('');
+  if (total === 0) { secSummary.style.display = 'none'; return; }
+  secSummary.innerHTML = html;
+  secSummary.style.display = 'flex';
+}
+
+// ── Correction-tab wrappers ──
+function setupCorrUI(agents) {
+  corrMode = true;
+  corrAgents = agents || [];
+  corrBubbles = {};
+  corrRendered.innerHTML =
+    _rosterHTML(corrAgents, '🛠️ Correction team assembled — ' + corrAgents.length + ' members') +
+    '<div id="corr-discussion"></div>';
+}
+function addCorrBubble(agentId, role, emoji, phase) {
+  _addBubble(document.getElementById('corr-discussion'), corrBubbles, agentId, role, emoji, phase, corrRendered);
+}
+function appendCorrChunk(agentId, chunk) { _bubbleChunk(corrBubbles, agentId, chunk, corrRendered); }
+function finishCorrBubble(agentId) { _bubbleFinish(corrBubbles, agentId, corrRendered); }
+function updateCorrSynthProgress(label, pct) {
+  _updateSynthBar(document.getElementById('corr-discussion'), 'Writing the correction plan…', label, pct, corrRendered);
+}
+function installCorrTranscriptToggle() {
+  _installTranscriptToggle({
+    html: corrTranscriptHTML,
+    btnId: 'btn-corr-discussion',
+    panelId: 'corr-transcript-panel',
+    headerEl: document.querySelector('#tab-correction .plan-header'),
+    renderedEl: corrRendered,
+    label: '💬 How the team built this plan',
+    beforeBtn: document.getElementById('btn-corr-copy'),
+  });
+}
+function renderCorrProgressUI(phase) {
+  corrRendered.innerHTML =
+    '<div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;gap:14px;text-align:center;padding:24px">' +
+      '<div class="dot-pulse"><span></span><span></span><span></span></div>' +
+      '<div style="font-size:14px;font-weight:600">' + escapeHtml(phase || 'Preparing…') + '</div>' +
+      '<div style="font-size:11px;opacity:0.55;margin-top:4px">🔒 No business logic will be changed. The plan appears here when ready.</div>' +
+    '</div>';
+}
+function renderCorrFull() {
+  if (!corrMarkdown) { return; }
+  var parts = splitPlanSections(corrMarkdown);
+  var frag = document.createDocumentFragment();
+  for (var i = 0; i < parts.length; i++) {
+    var d = document.createElement('div');
+    d.innerHTML = parseMarkdown(parts[i]);
+    frag.appendChild(d);
+  }
+  corrRendered.innerHTML = '';
+  corrRendered.appendChild(frag);
+  renderMermaidIn(corrRendered);
+}
+// Build the scope dropdowns from the analyzed project's sub-repos.
+function populateCorrScope(analysis) {
+  const subs = (analysis && analysis.subRepos) || [];
+  const opts = ['<option value="">Whole project' + (subs.length ? ' (' + subs.length + ' repos)' : '') + '</option>']
+    .concat(subs.map((s) => '<option value="' + escapeHtml(s) + '">Only: ' + escapeHtml(s) + '</option>'));
+  corrScope.innerHTML = opts.join('');
+  corrScope2.innerHTML = opts.join('');
 }
 
 // ─── Table of Contents (TOC) ──────────────────────────────────────────────────

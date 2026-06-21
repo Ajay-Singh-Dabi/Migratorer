@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import { RepoAnalysis, AnalysisOptions, ChatMessage, StackChangeIntent } from './types';
+import { RepoAnalysis, AnalysisOptions, ChatMessage, StackChangeIntent, TeamAgent } from './types';
 
 // ─── File Tree Path Filter ────────────────────────────────────────────────────
 
@@ -906,10 +906,64 @@ export async function streamMigrationPlan(
   cancellationToken: vscode.CancellationToken,
   onSectionStart?: (index: number, total: number, heading: string) => void
 ): Promise<string[]> {
-  const model   = await selectModel();
-  const context = buildContext(analysis, targetStack);
-  const metadataContext = buildContext({ ...analysis, keyFiles: [] }, targetStack);
+  const model = await selectModel();
+  return streamPlanSections(model, analysis, targetStack, options, onChunk, cancellationToken, onSectionStart);
+}
+
+/**
+ * Shared section-by-section plan generator. Used both by the single-model path
+ * (streamMigrationPlan) and the agent-team path (streamMigrationPlanTeam).
+ *
+ * @param extraContext  Optional block appended to every section's context — the
+ *                      team discussion digest is passed here so the synthesised
+ *                      plan reflects what the specialists agreed on.
+ */
+async function streamPlanSections(
+  model: vscode.LanguageModelChat,
+  analysis: RepoAnalysis,
+  targetStack: string,
+  options: AnalysisOptions,
+  onChunk: (chunk: string) => void,
+  cancellationToken: vscode.CancellationToken,
+  onSectionStart?: (index: number, total: number, heading: string) => void,
+  extraContext?: string
+): Promise<string[]> {
   const sections = buildSections(analysis, targetStack, options);
+  const sysPrefix = `You are a senior software architect producing one section of a professional migration plan. Be precise and actionable. Every file path you mention must exist in the file tree provided. Every package name must come from the dependency list. Do not invent placeholders.`;
+  const minimalPrompt = (heading: string) =>
+    `Write the "${heading}" section of a migration plan from ${analysis.detectedStack.framework} to ${targetStack}. Be specific and include code examples.`;
+  return runSectionLoop(
+    model, analysis, targetStack, sections, sysPrefix, minimalPrompt,
+    onChunk, cancellationToken, onSectionStart, extraContext, true
+  );
+}
+
+/**
+ * Generic section-by-section streamer shared by the migration plan and the
+ * architecture doc. Each section is generated with fallback + retry; sections
+ * that still fail are returned by heading.
+ *
+ * @param sysPrefix       Role framing prepended to every section prompt.
+ * @param minimalPrompt   Builds the last-resort prompt from a (heading) string.
+ * @param extraContext    Appended to context (e.g. the team discussion digest).
+ * @param suggestRetry    If true, failed sections emit the chat-retry hint.
+ */
+async function runSectionLoop(
+  model: vscode.LanguageModelChat,
+  analysis: RepoAnalysis,
+  targetStack: string,
+  sections: PlanSection[],
+  sysPrefix: string,
+  minimalPrompt: (heading: string) => string,
+  onChunk: (chunk: string) => void,
+  cancellationToken: vscode.CancellationToken,
+  onSectionStart?: (index: number, total: number, heading: string) => void,
+  extraContext?: string,
+  suggestRetry = true
+): Promise<string[]> {
+  const extra   = extraContext ? `\n\n${extraContext}` : '';
+  const context = buildContext(analysis, targetStack) + extra;
+  const metadataContext = buildContext({ ...analysis, keyFiles: [] }, targetStack) + extra;
   const failedSections: string[] = [];
 
   for (let i = 0; i < sections.length; i++) {
@@ -922,11 +976,10 @@ export async function streamMigrationPlan(
     // Emit the section heading immediately so the user sees forward motion
     onChunk(`\n\n${section.heading}\n\n`);
 
-    const sysPrefix = `You are a senior software architect producing one section of a professional migration plan. Be precise and actionable. Every file path you mention must exist in the file tree provided. Every package name must come from the dependency list. Do not invent placeholders.`;
-
+    const cleanHeading   = section.heading.replace(/^#+\s*/, '');
     const prompt         = `${sysPrefix}\n\n${context}\n\n---\n\n${section.ask}`;
     const metadataPrompt = `${sysPrefix}\n\n${metadataContext}\n\n---\n\n${section.ask}`;
-    const minimalPrompt  = `Write the "${section.heading.replace(/^#+\s*/, '')}" section of a migration plan from ${analysis.detectedStack.framework} to ${targetStack}. Be specific and include code examples.`;
+    const fallbackPrompt = minimalPrompt(cleanHeading);
 
     // Try to generate the section. If it produces nothing (or fails), retry
     // once with the fallback prompt before marking it as failed.
@@ -939,10 +992,10 @@ export async function streamMigrationPlan(
       sectionContent = '';
       try {
         if (attempt === 0) {
-          await streamWithFallback(model, prompt, metadataPrompt, minimalPrompt, captureChunk, cancellationToken);
+          await streamWithFallback(model, prompt, metadataPrompt, fallbackPrompt, captureChunk, cancellationToken);
         } else {
           // Second attempt: simpler minimal prompt, give the model a clean shot
-          await tryStream(model, minimalPrompt, captureChunk, cancellationToken);
+          await tryStream(model, fallbackPrompt, captureChunk, cancellationToken);
         }
         if (sectionContent.trim().length > 80) {
           succeeded = true;
@@ -955,15 +1008,911 @@ export async function streamMigrationPlan(
     }
 
     if (!succeeded && !cancellationToken.isCancellationRequested) {
-      const failureNotice =
-        `\n\n> **⚠️ This section could not be generated.** ` +
-        `To retry, type in chat: **"regenerate ${section.heading.replace(/^#+\s*/, '')}"**\n`;
+      const failureNotice = suggestRetry
+        ? `\n\n> **⚠️ This section could not be generated.** ` +
+          `To retry, type in chat: **"regenerate ${cleanHeading}"**\n`
+        : `\n\n> **⚠️ This section could not be generated.** Try regenerating the document.\n`;
       onChunk(failureNotice);
-      failedSections.push(section.heading.replace(/^#+\s*/, ''));
+      failedSections.push(cleanHeading);
     }
   }
 
   return failedSections;
+}
+
+// ─── Multi-Agent Team Plan Generation ─────────────────────────────────────────
+
+/** The team's accumulated discussion — cached so a re-target can reuse it. */
+export interface TeamDiscussion {
+  agents: TeamAgent[];  // the specialists (architect excluded)
+  digest: string;       // distilled findings fed into synthesis
+}
+
+/** Callbacks the panel wires to webview messages so the user sees the team talk. */
+export interface TeamCallbacks {
+  onTeamFormed: (agents: TeamAgent[]) => void;
+  onAgentStart: (agent: TeamAgent, phase: 'analysis' | 'discussion' | 'synthesis') => void;
+  onAgentChunk: (agentId: string, chunk: string) => void;
+  onAgentEnd: (agentId: string) => void;
+  /** Fired once the discussion is distilled — the panel caches it for re-targeting. */
+  onDiscussionComplete?: (discussion: TeamDiscussion) => void;
+}
+
+/** The lead architect — always present, frames the meeting and synthesises the plan. */
+const LEAD_ARCHITECT: TeamAgent = {
+  id: 'architect',
+  role: 'Lead Architect',
+  emoji: '🧑‍💼',
+  focus: 'Overall strategy, sequencing & final synthesis',
+  files: [],
+};
+
+/** Assign repo files to an agent by loosely matching the globs/keywords it claims. */
+function assignFilesToAgent(globs: string[] | undefined, fileTree: string[]): string[] {
+  if (!globs || globs.length === 0) { return []; }
+  const safe = filterFileTree(fileTree).safe;
+  const needles = globs.map((g) => g.toLowerCase().replace(/\*+/g, '').replace(/^\.?\//, ''));
+  const matched = safe.filter((p) => {
+    const lp = p.toLowerCase();
+    return needles.some((n) => n.length > 0 && lp.includes(n));
+  });
+  return matched.slice(0, 40);
+}
+
+/** Default team used if the orchestrator's JSON can't be parsed. */
+function defaultTeam(analysis: RepoAnalysis): TeamAgent[] {
+  const ds = analysis.detectedStack;
+  const team: TeamAgent[] = [
+    { id: 'backend', role: 'Backend Engineer', emoji: '⚙️', focus: 'Server-side logic, APIs & business rules', files: [] },
+    { id: 'frontend', role: 'Frontend Engineer', emoji: '🎨', focus: 'UI, client-side code & user experience', files: [] },
+  ];
+  if (ds.databases.length > 0) {
+    team.push({ id: 'data', role: 'Database Engineer', emoji: '🗄️', focus: 'Data models, queries & migrations', files: [] });
+  }
+  team.push({ id: 'qa', role: 'QA & Security Engineer', emoji: '🧪', focus: 'Testing strategy, risks & security', files: [] });
+  return team;
+}
+
+/** Compact stack + folder summary used when briefing a team-forming prompt. */
+function teamBriefing(analysis: RepoAnalysis): string {
+  const ds = analysis.detectedStack;
+  const { safe } = filterFileTree(analysis.fileTree);
+  const folders = Array.from(new Set(safe.map((p) => {
+    const i = p.indexOf('/');
+    return i >= 0 ? p.slice(0, i) : '(root)';
+  }))).slice(0, 25).join(', ');
+  return (
+    `Stack: ${ds.framework} / ${ds.primaryLanguage} ${ds.currentVersion}\n` +
+    `Runtime: ${ds.runtime} | Build: ${ds.buildTool} | Tests: ${ds.testingFrameworks.join(', ') || 'none'}\n` +
+    `Databases: ${ds.databases.join(', ') || 'none'} | CI: ${ds.ciSystem || 'none'} | Docker: ${ds.containerized ? 'yes' : 'no'}\n` +
+    `Top-level folders: ${folders}`
+  );
+}
+
+/**
+ * Generic team assembler: asks the model to pick 3-5 specialists for a given
+ * mission, parses the JSON, and falls back to a default roster on any failure.
+ *
+ * @param mission        One or two sentences describing the goal + the kind of
+ *                       roles to pick (e.g. migration specialists vs. doc analysts).
+ * @param defaultFactory Roster to use if the model output can't be parsed.
+ */
+async function formTeam(
+  model: vscode.LanguageModelChat,
+  analysis: RepoAnalysis,
+  mission: string,
+  defaultFactory: (a: RepoAnalysis) => TeamAgent[],
+  token: vscode.CancellationToken
+): Promise<TeamAgent[]> {
+  const prompt =
+    `${mission}\n\n${teamBriefing(analysis)}\n\n` +
+    `Return ONLY a JSON array, no markdown fences, no prose. Each object:\n` +
+    `{ "id": "short-kebab-id", "role": "Role name", "emoji": "one emoji", ` +
+    `"focus": "one short sentence", "fileGlobs": ["folder or extension keywords they own, e.g. src/api, .sql, components"] }`;
+
+  let raw = '';
+  try {
+    const res = await model.sendRequest([vscode.LanguageModelChatMessage.User(prompt)], {}, token);
+    for await (const part of res.text) { raw += part; }
+  } catch {
+    return defaultFactory(analysis);
+  }
+
+  const match = raw.match(/\[[\s\S]*\]/);
+  if (!match) { return defaultFactory(analysis); }
+  try {
+    const parsed = JSON.parse(match[0]) as Array<{ id?: string; role?: string; emoji?: string; focus?: string; fileGlobs?: string[] }>;
+    const seen = new Set<string>();
+    const agents: TeamAgent[] = parsed
+      .filter((a) => a && a.role)
+      .slice(0, 5)
+      .map((a, i) => {
+        let id = (a.id || a.role || `agent-${i}`).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || `agent-${i}`;
+        while (seen.has(id)) { id = `${id}-${i}`; }
+        seen.add(id);
+        return {
+          id,
+          role: a.role!.trim(),
+          emoji: (a.emoji || '🧩').trim(),
+          focus: (a.focus || '').trim(),
+          files: assignFilesToAgent(a.fileGlobs, analysis.fileTree),
+        };
+      });
+    return agents.length >= 2 ? agents : defaultFactory(analysis);
+  } catch {
+    return defaultFactory(analysis);
+  }
+}
+
+/** Assemble a migration team tailored to the detected stack + target. */
+function formAgentTeam(
+  model: vscode.LanguageModelChat,
+  analysis: RepoAnalysis,
+  targetStack: string,
+  token: vscode.CancellationToken
+): Promise<TeamAgent[]> {
+  const mission =
+    `You are the lead architect assembling a small, focused team to migrate a software project to ${targetStack}. ` +
+    `Pick 3 to 5 specialist roles that best fit THIS project and migration, tailored to the actual ` +
+    `technologies (e.g. "React Specialist", "Spring/JPA Specialist", "CI/CD Engineer").`;
+  return formTeam(model, analysis, mission, defaultTeam, token);
+}
+
+/** Stream a single agent's spoken turn, emitting start/chunk/end callbacks. */
+async function runAgentTurn(
+  model: vscode.LanguageModelChat,
+  agent: TeamAgent,
+  prompt: string,
+  phase: 'analysis' | 'discussion' | 'synthesis',
+  callbacks: TeamCallbacks,
+  token: vscode.CancellationToken
+): Promise<string> {
+  callbacks.onAgentStart(agent, phase);
+  let text = '';
+  try {
+    await tryStream(model, prompt, (c) => { text += c; callbacks.onAgentChunk(agent.id, c); }, token);
+  } catch {
+    // A failed turn shouldn't abort the whole meeting — leave the bubble as-is.
+  }
+  callbacks.onAgentEnd(agent.id);
+  return text;
+}
+
+/**
+ * Generate a migration plan as a simulated team:
+ *   1. Lead architect assembles a stack-tailored team and frames the goal
+ *   2. Each specialist analyses its domain (round 1)
+ *   3. Specialists react to each other — dependencies, conflicts (round 2)
+ *   4. The discussion is distilled and fed to the section-by-section synthesis,
+ *      which streams the final plan via onChunk (same format as the solo path)
+ *
+ * Returns the headings of any sections that failed to generate.
+ */
+export async function streamMigrationPlanTeam(
+  analysis: RepoAnalysis,
+  targetStack: string,
+  options: AnalysisOptions,
+  onChunk: (chunk: string) => void,
+  cancellationToken: vscode.CancellationToken,
+  onSectionStart: ((index: number, total: number, heading: string) => void) | undefined,
+  callbacks: TeamCallbacks
+): Promise<string[]> {
+  const model = await selectModel();
+  const ds = analysis.detectedStack;
+  const stackLine = `${ds.framework} / ${ds.primaryLanguage} ${ds.currentVersion}`;
+
+  // 1 ── Assemble the team
+  const specialists = await formAgentTeam(model, analysis, targetStack, cancellationToken);
+  const roster = [LEAD_ARCHITECT, ...specialists];
+  callbacks.onTeamFormed(roster);
+  if (cancellationToken.isCancellationRequested) { return []; }
+
+  // Architect opens the meeting
+  await runAgentTurn(
+    model, LEAD_ARCHITECT,
+    `You are the Lead Architect kicking off a migration team meeting. Goal: migrate this project ` +
+    `from ${stackLine} to ${targetStack}. Your team: ${specialists.map((s) => s.role).join(', ')}. ` +
+    `In 2-3 sentences, set the stage and tell each specialist what to focus on. Conversational, first person, no markdown headings.`,
+    'analysis', callbacks, cancellationToken
+  );
+  if (cancellationToken.isCancellationRequested) { return []; }
+
+  // 2 ── Round 1: each specialist assesses its own area
+  const baseContext = buildContext(analysis, targetStack);
+  const round1: Record<string, string> = {};
+  for (const agent of specialists) {
+    if (cancellationToken.isCancellationRequested) { return []; }
+    const filesBlock = agent.files.length
+      ? `\nFiles in your area:\n${agent.files.slice(0, 30).join('\n')}\n`
+      : '';
+    const prompt =
+      `${baseContext}\n\n---\n` +
+      `You are the ${agent.role} (${agent.focus}) on a team migrating this project from ${stackLine} to ${targetStack}.${filesBlock}\n` +
+      `Give your initial assessment of YOUR area only, in 3-5 short bullet points: the key migration ` +
+      `challenges, the riskiest code, and what teammates need to know from you. Reference real files, ` +
+      `packages or patterns from the context above. Speak in first person like in a meeting. No headings.`;
+    round1[agent.id] = await runAgentTurn(model, agent, prompt, 'analysis', callbacks, cancellationToken);
+  }
+
+  // 3 ── Round 2: specialists respond to each other
+  const transcript1 = specialists
+    .map((a) => `${a.role}:\n${round1[a.id] || '(no input)'}`)
+    .join('\n\n');
+  const round2: Record<string, string> = {};
+  for (const agent of specialists) {
+    if (cancellationToken.isCancellationRequested) { break; }
+    const prompt =
+      `You are the ${agent.role} on a team migrating this project to ${targetStack}. ` +
+      `Here is what your teammates said in the first round:\n\n${transcript1}\n\n---\n` +
+      `Respond to them: call out dependencies between your area and theirs, flag conflicts or the order ` +
+      `things must happen in, and agree or push back where it matters. 2-4 sentences, conversational, ` +
+      `first person. Address teammates by role. No markdown headings.`;
+    round2[agent.id] = await runAgentTurn(model, agent, prompt, 'discussion', callbacks, cancellationToken);
+  }
+  if (cancellationToken.isCancellationRequested) { return []; }
+
+  // 4 ── Distil the discussion and synthesise the plan
+  const digest =
+    `─── Migration Team Discussion (authoritative expert input — honour these findings) ───\n\n` +
+    specialists.map((a) =>
+      `### ${a.role} — ${a.focus}\n` +
+      `Assessment: ${round1[a.id] || '(none)'}\n` +
+      `Follow-up: ${round2[a.id] || '(none)'}`
+    ).join('\n\n');
+
+  // Cache the discussion so a later re-target can reuse it instead of re-running
+  // the full meeting (the codebase hasn't changed — only the target will).
+  callbacks.onDiscussionComplete?.({ agents: specialists, digest });
+
+  callbacks.onAgentStart(LEAD_ARCHITECT, 'synthesis');
+  callbacks.onAgentChunk(LEAD_ARCHITECT.id,
+    'Thanks everyone — folding all of that into the migration plan now. Writing it up section by section.');
+  callbacks.onAgentEnd(LEAD_ARCHITECT.id);
+
+  return streamPlanSections(
+    model, analysis, targetStack, options, onChunk, cancellationToken, onSectionStart, digest
+  );
+}
+
+/**
+ * Regenerate the plan for a NEW target by reusing a cached team discussion.
+ *
+ * The codebase is unchanged, so we skip the expensive full analysis round and
+ * instead run one lightweight "delta" round: each existing specialist reacts to
+ * the target change in light of the prior discussion. The updated discussion is
+ * re-cached, then the plan is synthesised as usual.
+ */
+export async function streamMigrationPlanTeamDelta(
+  analysis: RepoAnalysis,
+  newTarget: string,
+  oldTarget: string,
+  options: AnalysisOptions,
+  onChunk: (chunk: string) => void,
+  cancellationToken: vscode.CancellationToken,
+  onSectionStart: ((index: number, total: number, heading: string) => void) | undefined,
+  callbacks: TeamCallbacks,
+  prior: TeamDiscussion
+): Promise<string[]> {
+  const model = await selectModel();
+  const targetLabel = oldTarget ? `from "${oldTarget}" to "${newTarget}"` : `to "${newTarget}"`;
+
+  callbacks.onTeamFormed([LEAD_ARCHITECT, ...prior.agents]);
+  if (cancellationToken.isCancellationRequested) { return []; }
+
+  // Architect re-frames the change for the team
+  await runAgentTurn(
+    model, LEAD_ARCHITECT,
+    `You are the Lead Architect. We already analysed this codebase and produced a migration plan. ` +
+    `The target just changed ${targetLabel}. In 1-2 sentences, tell the team what to reconsider for the new target. ` +
+    `Conversational, first person, no markdown headings.`,
+    'analysis', callbacks, cancellationToken
+  );
+  if (cancellationToken.isCancellationRequested) { return []; }
+
+  // Delta round: each specialist reacts to the new target using the prior discussion
+  const delta: Record<string, string> = {};
+  for (const agent of prior.agents) {
+    if (cancellationToken.isCancellationRequested) { break; }
+    const prompt =
+      `${prior.digest}\n\n---\n` +
+      `You are the ${agent.role} (${agent.focus}). The migration target changed ${targetLabel}. ` +
+      `The codebase is unchanged. Based on the prior team discussion above, what changes for YOUR area ` +
+      `under the new target? 2-4 sentences, first person. If little changes for you, say so briefly. No headings.`;
+    delta[agent.id] = await runAgentTurn(model, agent, prompt, 'discussion', callbacks, cancellationToken);
+  }
+  if (cancellationToken.isCancellationRequested) { return []; }
+
+  const updatedDigest =
+    `${prior.digest}\n\n─── Re-targeting discussion (target changed ${targetLabel}) ───\n\n` +
+    prior.agents.map((a) => `### ${a.role}\n${delta[a.id] || '(no change)'}`).join('\n\n');
+
+  // Re-cache so a subsequent swap builds on this one
+  callbacks.onDiscussionComplete?.({ agents: prior.agents, digest: updatedDigest });
+
+  callbacks.onAgentStart(LEAD_ARCHITECT, 'synthesis');
+  callbacks.onAgentChunk(LEAD_ARCHITECT.id, `Got it — regenerating the plan for ${newTarget} now.`);
+  callbacks.onAgentEnd(LEAD_ARCHITECT.id);
+
+  return streamPlanSections(
+    model, analysis, newTarget, options, onChunk, cancellationToken, onSectionStart, updatedDigest
+  );
+}
+
+// ─── Multi-Agent Architecture (LLD) Documentation ─────────────────────────────
+
+/** The lead for the documentation team. */
+const LEAD_ENGINEER: TeamAgent = {
+  id: 'lead-engineer',
+  role: 'Principal Engineer',
+  emoji: '🧑‍💻',
+  focus: 'Architecture overview & documentation synthesis',
+  files: [],
+};
+
+/** Fallback documentation team if the model output can't be parsed. */
+function defaultDocTeam(analysis: RepoAnalysis): TeamAgent[] {
+  const ds = analysis.detectedStack;
+  const team: TeamAgent[] = [
+    { id: 'modules', role: 'Domain & Modules Analyst', emoji: '🧩', focus: 'Core modules, classes, functions & their responsibilities', files: [] },
+    { id: 'api', role: 'API & Integration Analyst', emoji: '🔌', focus: 'Interfaces, contracts, request/response flows', files: [] },
+  ];
+  if (ds.databases.length > 0) {
+    team.push({ id: 'data', role: 'Data & Persistence Analyst', emoji: '🗄️', focus: 'Data models, schemas & storage', files: [] });
+  }
+  team.push({ id: 'platform', role: 'Build, Test & Platform Analyst', emoji: '🛠️', focus: 'Build, config, testing & deployment', files: [] });
+  return team;
+}
+
+/** The full set of low-level-design sections a new developer needs. */
+function buildArchitectureSections(analysis: RepoAnalysis): PlanSection[] {
+  const lang = analysis.detectedStack.primaryLanguage;
+  const sections: PlanSection[] = [
+    { heading: '## 1. System Overview & Purpose',
+      ask: `Explain what this project is, the problem it solves, who its users are, and the core capabilities. Summarise the tech stack and the overall architectural style (e.g. layered, MVC, event-driven, plugin-based). Keep it concrete to THIS repo.` },
+    { heading: '## 2. High-Level Architecture',
+      ask: `Describe the major components/layers and how they interact at runtime. Include a Mermaid \`graph TD\` component diagram showing the main modules and their dependencies. Explain the responsibility of each box and the direction of data/control flow.` },
+    { heading: '## 3. Directory & Module Structure',
+      ask: `Walk through the top-level folders and key files from the file tree. For each, state its responsibility and what a developer would find inside. Present it as an annotated tree or table. Reference real paths only.` },
+    { heading: '## 4. Core Modules — Low-Level Design',
+      ask: `This is the most important section. For each significant module/file, give a LOW-LEVEL design: its responsibility, the key classes/functions/types it exports, their signatures, what each does, important internal logic, and how it collaborates with other modules. Use ${lang} code signatures from the provided source. Be exhaustive and precise — a new developer should be able to navigate the code from this alone.` },
+    { heading: '## 5. Data Models & Schema',
+      ask: `Document the core data structures, domain entities, and (if any) database schema: fields, types, relationships, constraints. Include a Mermaid \`erDiagram\` (or class diagram for in-memory models) showing relationships. Reference the real type/model definitions.` },
+    { heading: '## 6. API & Interface Contracts',
+      ask: `Document the public interfaces: HTTP/RPC endpoints, CLI commands, message/event contracts, or exported library APIs as applicable. For each, give the signature/route, inputs, outputs, error cases, and side effects. Use a table where it helps.` },
+    { heading: '## 7. Key Workflows & Data Flow',
+      ask: `Pick the 2-4 most important end-to-end operations and trace each through the code, function by function. Include a Mermaid \`sequenceDiagram\` for each, naming the real participants (modules/functions). Explain how data is transformed along the way.` },
+    { heading: '## 8. Design Patterns & Conventions',
+      ask: `Identify the design patterns, idioms, and conventions used (naming, file organisation, dependency injection, error propagation, etc.). Give concrete examples from the code so a new developer writes code consistent with the existing style.` },
+    { heading: '## 9. State, Concurrency & Lifecycle',
+      ask: `Explain how state is managed, how async/concurrency is handled, object/request lifecycles, caching, and any schedulers, queues, or background work. Reference the real mechanisms used in this codebase.` },
+    { heading: '## 10. Configuration & Environment',
+      ask: `Document configuration files, environment variables (use the discovered env var inventory), feature flags, and defaults. Explain what each controls and how to configure the app for local development.` },
+    { heading: '## 11. Error Handling & Logging',
+      ask: `Describe the error-handling strategy, where and how errors are caught and surfaced, validation, and logging/observability. Point to the real code that implements it.` },
+    { heading: '## 12. External Dependencies & Integrations',
+      ask: `List the key third-party dependencies and WHY each is used, plus any external services/APIs the project integrates with. Map dependencies to the modules that rely on them.` },
+    { heading: '## 13. Build, Run, Test & Deploy',
+      ask: `Give the concrete steps to build, run, and test the project locally (real scripts/commands from the manifests), and how it is packaged/deployed. Include prerequisites and common gotchas.` },
+    { heading: '## 14. Security Considerations',
+      ask: `Document authentication/authorization, secret handling, input validation, and the trust boundaries / attack surface. Note anything a new developer must be careful about.` },
+    { heading: '## 15. Extension Guide — How to Add a Feature',
+      ask: `Provide a step-by-step recipe for adding a typical new feature to THIS codebase, naming the exact files/modules a developer would touch and in what order, following the existing patterns. Include common pitfalls.` },
+    { heading: '## 16. Glossary & Onboarding Checklist',
+      ask: `Define domain-specific and project-specific terms a newcomer will encounter. Then give a practical first-week onboarding checklist (what to read, run, and try first).` },
+  ];
+  return sections;
+}
+
+/**
+ * Generate deep low-level-design (LLD) documentation as a simulated team:
+ *   1. A principal engineer assembles stack-tailored documentation analysts
+ *   2. Each analyst deep-dives its area of the code (round 1)
+ *   3. Analysts cross-reference how modules connect (round 2)
+ *   4. The findings are distilled and fed to the section-by-section synthesis,
+ *      which streams the LLD document via onChunk
+ *
+ * Returns the headings of any sections that failed to generate.
+ */
+export async function streamArchitectureDoc(
+  analysis: RepoAnalysis,
+  onChunk: (chunk: string) => void,
+  cancellationToken: vscode.CancellationToken,
+  onSectionStart: ((index: number, total: number, heading: string) => void) | undefined,
+  callbacks: TeamCallbacks
+): Promise<string[]> {
+  const model = await selectModel();
+  const ds = analysis.detectedStack;
+  const stackLine = `${ds.framework} / ${ds.primaryLanguage} ${ds.currentVersion}`;
+
+  // 1 ── Assemble the documentation team
+  const mission =
+    `You are the principal engineer assembling a small team to write deep low-level design (LLD) ` +
+    `documentation so a NEW developer can understand this ${stackLine} codebase. Pick 3 to 5 analyst ` +
+    `roles tailored to the project (e.g. "Domain & Modules Analyst", "Data & Persistence Analyst", ` +
+    `"API & Integration Analyst", "Frontend/UI Analyst", "Build & Platform Analyst").`;
+  const analysts = await formTeam(model, analysis, mission, defaultDocTeam, cancellationToken);
+  const roster = [LEAD_ENGINEER, ...analysts];
+  callbacks.onTeamFormed(roster);
+  if (cancellationToken.isCancellationRequested) { return []; }
+
+  // Principal engineer frames the documentation effort
+  await runAgentTurn(
+    model, LEAD_ENGINEER,
+    `You are the Principal Engineer kicking off a documentation effort: produce a deep low-level design ` +
+    `for this ${stackLine} project so a new developer can understand it fully. Your team: ` +
+    `${analysts.map((a) => a.role).join(', ')}. In 2-3 sentences, set the goal and tell each analyst ` +
+    `what to investigate. Conversational, first person, no markdown headings.`,
+    'analysis', callbacks, cancellationToken
+  );
+  if (cancellationToken.isCancellationRequested) { return []; }
+
+  // 2 ── Round 1: each analyst deep-dives its area
+  const baseContext = buildContext(analysis, 'N/A (architecture documentation)');
+  const round1: Record<string, string> = {};
+  for (const agent of analysts) {
+    if (cancellationToken.isCancellationRequested) { return []; }
+    const filesBlock = agent.files.length
+      ? `\nFiles in your area:\n${agent.files.slice(0, 30).join('\n')}\n`
+      : '';
+    const prompt =
+      `${baseContext}\n\n---\n` +
+      `You are the ${agent.role} (${agent.focus}) documenting this codebase for new developers.${filesBlock}\n` +
+      `Give a detailed technical breakdown of YOUR area in 4-6 bullet points: the key modules/classes/` +
+      `functions and their responsibilities, important data structures, how things flow, and any non-obvious ` +
+      `design decisions. Reference real files, types and functions from the context. First person, like in a ` +
+      `design review. No headings.`;
+    round1[agent.id] = await runAgentTurn(model, agent, prompt, 'analysis', callbacks, cancellationToken);
+  }
+
+  // 3 ── Round 2: analysts cross-reference how the pieces connect
+  const transcript1 = analysts
+    .map((a) => `${a.role}:\n${round1[a.id] || '(no input)'}`)
+    .join('\n\n');
+  const round2: Record<string, string> = {};
+  for (const agent of analysts) {
+    if (cancellationToken.isCancellationRequested) { break; }
+    const prompt =
+      `You are the ${agent.role} documenting this codebase. Here is what your teammates described:\n\n` +
+      `${transcript1}\n\n---\n` +
+      `Explain how YOUR area connects to theirs: the call paths, data that crosses boundaries, shared types, ` +
+      `and ordering/lifecycle dependencies a new developer must understand. 2-4 sentences, first person, ` +
+      `address teammates by role. No headings.`;
+    round2[agent.id] = await runAgentTurn(model, agent, prompt, 'discussion', callbacks, cancellationToken);
+  }
+  if (cancellationToken.isCancellationRequested) { return []; }
+
+  // 4 ── Distil the findings and synthesise the LLD document
+  const digest =
+    `─── Engineering Team Analysis (authoritative findings — base the documentation on these) ───\n\n` +
+    analysts.map((a) =>
+      `### ${a.role} — ${a.focus}\n` +
+      `Deep-dive: ${round1[a.id] || '(none)'}\n` +
+      `Cross-module notes: ${round2[a.id] || '(none)'}`
+    ).join('\n\n');
+
+  callbacks.onDiscussionComplete?.({ agents: analysts, digest });
+
+  callbacks.onAgentStart(LEAD_ENGINEER, 'synthesis');
+  callbacks.onAgentChunk(LEAD_ENGINEER.id,
+    'Great analysis, team — writing up the full low-level design document now, section by section.');
+  callbacks.onAgentEnd(LEAD_ENGINEER.id);
+
+  const sections = buildArchitectureSections(analysis);
+  const sysPrefix =
+    `You are a principal engineer writing one section of the low-level design (LLD) documentation for ` +
+    `this codebase so a new developer can understand it deeply. Be precise, concrete and exhaustive. ` +
+    `Reference real files, classes, functions, types and data structures from the provided context. ` +
+    `Use Mermaid diagrams (graph/sequenceDiagram/erDiagram) where the section calls for them. ` +
+    `Never invent file names or APIs that aren't in the context.`;
+  const minimalPrompt = (heading: string) =>
+    `Write the "${heading}" section of low-level design documentation for a ${stackLine} project. ` +
+    `Be specific and concrete, with code references and examples.`;
+
+  return runSectionLoop(
+    model, analysis, 'N/A (architecture documentation)', sections, sysPrefix, minimalPrompt,
+    onChunk, cancellationToken, onSectionStart, digest, false
+  );
+}
+
+// ─── Multi-Agent Security / Vulnerability Audit ───────────────────────────────
+
+/** The lead for the security team. */
+const LEAD_SECURITY: TeamAgent = {
+  id: 'appsec-lead',
+  role: 'AppSec Lead',
+  emoji: '🛡️',
+  focus: 'Threat model, triage & remediation synthesis',
+  files: [],
+};
+
+/** Fallback security team if the model output can't be parsed. */
+function defaultSecurityTeam(analysis: RepoAnalysis): TeamAgent[] {
+  const ds = analysis.detectedStack;
+  const team: TeamAgent[] = [
+    { id: 'injection', role: 'Injection & Input Validation Analyst', emoji: '💉', focus: 'SQLi, XSS, command/template injection, deserialization', files: [] },
+    { id: 'authz', role: 'AuthN/AuthZ Analyst', emoji: '🔑', focus: 'Authentication, sessions, access control, IDOR', files: [] },
+    { id: 'supply', role: 'Dependency & Supply-Chain Analyst', emoji: '📦', focus: 'Vulnerable/outdated packages, transitive risk', files: [] },
+    { id: 'secrets', role: 'Secrets & Config Analyst', emoji: '🔐', focus: 'Hardcoded secrets, insecure config, exposure', files: [] },
+  ];
+  if (ds.databases.length > 0) {
+    team.push({ id: 'data', role: 'Data Security Analyst', emoji: '🗄️', focus: 'Data handling, crypto, PII exposure', files: [] });
+  }
+  return team;
+}
+
+/** Security report sections — ordered by severity so findings sort high→low. */
+function buildSecuritySections(): PlanSection[] {
+  const findingFmt =
+    `Format EACH finding exactly as:\n` +
+    `#### [<SEVERITY>] <short title>  (CWE-xxx / OWASP category if known)\n` +
+    `- **Location:** real file path(s) and function/line area\n` +
+    `- **Why it's a risk:** the impact and a concrete exploit/attack scenario\n` +
+    `- **Vulnerable code:** a short snippet from the actual code\n` +
+    `- **How to fix:** the remediation WITH a corrected code example\n` +
+    `<SEVERITY> must be one of CRITICAL, HIGH, MEDIUM, LOW.`;
+  return [
+    { heading: '## Executive Summary',
+      ask: `Summarise the overall security posture of this codebase: the most serious risks, recurring root causes, and a count of findings by severity (Critical/High/Medium/Low) as a small table. Be specific to what the team found.` },
+    { heading: '## 🔴 Critical Vulnerabilities',
+      ask: `List ONLY the CRITICAL findings the team identified (remote code execution, auth bypass, secret leakage enabling takeover, etc.). ${findingFmt}\nIf there are none, write "No critical issues identified."` },
+    { heading: '## 🟠 High-Severity Vulnerabilities',
+      ask: `List ONLY the HIGH-severity findings (injection, broken access control, sensitive data exposure, etc.). ${findingFmt}\nIf there are none, write "No high-severity issues identified."` },
+    { heading: '## 🟡 Medium-Severity Vulnerabilities',
+      ask: `List ONLY the MEDIUM-severity findings (missing validation, weak config, CSRF gaps, verbose errors, etc.). ${findingFmt}\nIf there are none, write "No medium-severity issues identified."` },
+    { heading: '## 🟢 Low-Severity & Hardening',
+      ask: `List LOW-severity findings and hardening recommendations (defense-in-depth, headers, dependency hygiene). ${findingFmt}\nIf there are none, write "No low-severity issues identified."` },
+    { heading: '## 📦 Dependency & Supply-Chain Risks',
+      ask: `Assess the dependencies for known-vulnerable or outdated packages and supply-chain risk. For each risky dependency: name, the concern, and the recommended version/replacement. Use a table where helpful. Only reference packages from the provided dependency list.` },
+    { heading: '## 🛠️ Remediation Roadmap',
+      ask: `Give a prioritised remediation plan: what to fix first and why, grouped into immediate / short-term / longer-term. Reference the findings above and any quick wins.` },
+  ];
+}
+
+/**
+ * Run a whole-project security audit as a simulated team:
+ *   1. An AppSec lead assembles stack-tailored security analysts
+ *   2. Each analyst hunts vulnerabilities in its specialty (round 1)
+ *   3. Analysts correlate findings — chained attacks, shared root causes (round 2)
+ *   4. The findings are distilled and synthesised into a severity-sorted report
+ *      (streamed via onChunk) with where / why / how-to-fix and code-level detail.
+ *
+ * Returns the headings of any sections that failed to generate.
+ */
+export async function streamSecurityAudit(
+  analysis: RepoAnalysis,
+  onChunk: (chunk: string) => void,
+  cancellationToken: vscode.CancellationToken,
+  onSectionStart: ((index: number, total: number, heading: string) => void) | undefined,
+  callbacks: TeamCallbacks
+): Promise<string[]> {
+  const model = await selectModel();
+  const ds = analysis.detectedStack;
+  const stackLine = `${ds.framework} / ${ds.primaryLanguage} ${ds.currentVersion}`;
+
+  // 1 ── Assemble the security team
+  const mission =
+    `You are the AppSec lead assembling a small red-team/audit crew to find security vulnerabilities ` +
+    `across this ${stackLine} codebase. Pick 3 to 5 security analyst roles tailored to the project ` +
+    `(e.g. "Injection & Input Validation Analyst", "AuthN/AuthZ Analyst", "Dependency & Supply-Chain ` +
+    `Analyst", "Secrets & Config Analyst", "Data Security Analyst").`;
+  const analysts = await formTeam(model, analysis, mission, defaultSecurityTeam, cancellationToken);
+  const roster = [LEAD_SECURITY, ...analysts];
+  callbacks.onTeamFormed(roster);
+  if (cancellationToken.isCancellationRequested) { return []; }
+
+  // AppSec lead frames the threat model
+  await runAgentTurn(
+    model, LEAD_SECURITY,
+    `You are the AppSec Lead kicking off a whole-project security audit of this ${stackLine} codebase. ` +
+    `Your team: ${analysts.map((a) => a.role).join(', ')}. In 2-3 sentences, set the threat model ` +
+    `(what an attacker would target) and tell each analyst where to focus. First person, no markdown headings.`,
+    'analysis', callbacks, cancellationToken
+  );
+  if (cancellationToken.isCancellationRequested) { return []; }
+
+  // 2 ── Round 1: each analyst hunts vulnerabilities in its specialty
+  const baseContext = buildContext(analysis, 'N/A (security audit)');
+  const round1: Record<string, string> = {};
+  for (const agent of analysts) {
+    if (cancellationToken.isCancellationRequested) { return []; }
+    const filesBlock = agent.files.length
+      ? `\nFiles in your area:\n${agent.files.slice(0, 30).join('\n')}\n`
+      : '';
+    const prompt =
+      `${baseContext}\n\n---\n` +
+      `You are the ${agent.role} (${agent.focus}) auditing this codebase for security vulnerabilities.${filesBlock}\n` +
+      `Hunt for concrete vulnerabilities in YOUR area. For each, state: a short title, a SEVERITY ` +
+      `(Critical/High/Medium/Low), the exact location (real file + function), why it's exploitable, and ` +
+      `the fix. Reference real code from the context — do NOT invent issues. If your area looks clean, say ` +
+      `so honestly. First person, like in a security review. No markdown headings.`;
+    round1[agent.id] = await runAgentTurn(model, agent, prompt, 'analysis', callbacks, cancellationToken);
+  }
+
+  // 3 ── Round 2: analysts correlate findings (chained attacks, shared causes)
+  const transcript1 = analysts
+    .map((a) => `${a.role}:\n${round1[a.id] || '(no input)'}`)
+    .join('\n\n');
+  const round2: Record<string, string> = {};
+  for (const agent of analysts) {
+    if (cancellationToken.isCancellationRequested) { break; }
+    const prompt =
+      `You are the ${agent.role} on a security audit. Here is what your teammates found:\n\n` +
+      `${transcript1}\n\n---\n` +
+      `Correlate with your area: can any findings be chained into a worse attack? Do several share a root ` +
+      `cause? Do you agree with their severities, or should any be raised/lowered? 2-4 sentences, first ` +
+      `person, address teammates by role. No markdown headings.`;
+    round2[agent.id] = await runAgentTurn(model, agent, prompt, 'discussion', callbacks, cancellationToken);
+  }
+  if (cancellationToken.isCancellationRequested) { return []; }
+
+  // 4 ── Distil findings and synthesise the severity-sorted report
+  const digest =
+    `─── Security Team Findings (authoritative — base the report on these, keep severities consistent) ───\n\n` +
+    analysts.map((a) =>
+      `### ${a.role} — ${a.focus}\n` +
+      `Findings: ${round1[a.id] || '(none)'}\n` +
+      `Correlation notes: ${round2[a.id] || '(none)'}`
+    ).join('\n\n');
+
+  callbacks.onDiscussionComplete?.({ agents: analysts, digest });
+
+  callbacks.onAgentStart(LEAD_SECURITY, 'synthesis');
+  callbacks.onAgentChunk(LEAD_SECURITY.id,
+    'Good work, team — triaging everything and writing the severity-sorted vulnerability report now.');
+  callbacks.onAgentEnd(LEAD_SECURITY.id);
+
+  const sections = buildSecuritySections();
+  const sysPrefix =
+    `You are an application security engineer writing one section of a professional vulnerability report ` +
+    `for this codebase. Be precise and evidence-based: every finding must reference real files/functions ` +
+    `from the provided context and include code-level detail and a concrete fix. Never invent ` +
+    `vulnerabilities or file names. Keep severity ratings consistent with the team's findings.`;
+  const minimalPrompt = (heading: string) =>
+    `Write the "${heading}" section of a security vulnerability report for a ${stackLine} project, ` +
+    `with concrete findings, severities, locations and code-level fixes.`;
+
+  return runSectionLoop(
+    model, analysis, 'N/A (security audit)', sections, sysPrefix, minimalPrompt,
+    onChunk, cancellationToken, onSectionStart, digest, false
+  );
+}
+
+// ─── Multi-Agent Behavior-Preserving Correction (team-of-teams) ───────────────
+
+/** The chief engineer who leads the correction effort. */
+const LEAD_CHIEF: TeamAgent = {
+  id: 'chief-engineer',
+  role: 'Chief Engineer',
+  emoji: '🧑‍🔧',
+  focus: 'Leads the correction; enforces "no business-logic change"',
+  files: [],
+};
+
+/** The guardian whose sole job is to protect existing behavior. */
+const GUARDIAN: TeamAgent = {
+  id: 'guardian',
+  role: 'Behavior-Preservation Guardian',
+  emoji: '🔒',
+  focus: 'Locks business-logic invariants & defines the verification checklist',
+  files: [],
+};
+
+const REPO_SQUAD_CAP = 6; // max dedicated per-repo agents (rest covered project-wide)
+
+/** Fallback specialist team for a single-repo correction. */
+function defaultCorrectionTeam(_analysis: RepoAnalysis): TeamAgent[] {
+  return [
+    { id: 'structure', role: 'Structure & Modularity Analyst', emoji: '🧱', focus: 'Layering, boundaries, file organisation', files: [] },
+    { id: 'logic', role: 'Logic & Control-Flow Analyst', emoji: '🧠', focus: 'Behavior, edge cases, side effects', files: [] },
+    { id: 'quality', role: 'Code Quality Analyst', emoji: '🧹', focus: 'Dead code, duplication, naming, smells', files: [] },
+    { id: 'deps', role: 'Dependencies & Build Analyst', emoji: '📦', focus: 'Dependencies, build config, tooling', files: [] },
+  ];
+}
+
+/** Behavior-preserving correction report sections. */
+function buildCorrectionSections(scopeLabel: string): PlanSection[] {
+  return [
+    { heading: '## Executive Summary',
+      ask: `Summarise the health of ${scopeLabel}: the biggest correction opportunities, the recurring root causes, and restate the hard rule — NO business logic may change; the project must behave exactly as it does today.` },
+    { heading: '## 🔒 Business-Logic Invariants — DO NOT CHANGE',
+      ask: `From the Guardian's findings, list the business-logic invariants that MUST stay identical: input→output behaviors, public API/interface contracts, side effects, error/edge-case handling, and data shapes. These are the contract every correction must preserve. Be concrete and reference real functions/endpoints.` },
+    { heading: '## Project Structure Assessment',
+      ask: `Assess the current structure (which may be poor): what is badly organised and why, and the target structure. Make clear these are MOVES/RENAMES/SPLITS that preserve behavior, not logic rewrites.` },
+    { heading: '## Per-Repo / Per-Module Corrections',
+      ask: `For each repository/module in scope, list concrete corrections. For each: the issue, the safe fix WITH before/after code, a risk level (Low/Med/High), and an explicit note on why behavior is unchanged. Reference real files only.` },
+    { heading: '## Cross-Repo Integration & Contracts',
+      ask: `Describe how the repos/modules interact and which corrections touch shared contracts. Any change crossing a boundary must remain contract-compatible — state how compatibility is kept (or how to version it safely).` },
+    { heading: '## Dead Code, Duplication & Dependencies',
+      ask: `Identify safe removals: dead code, duplication to consolidate, and unused/outdated dependencies. For each, show the evidence it is truly unused/safe to remove so no behavior is lost.` },
+    { heading: '## Safe Refactoring Order',
+      ask: `Give a step-by-step sequence ordered lowest-risk first, such that the project keeps building and passing tests after EACH step. Group into small, independently-verifiable changes.` },
+    { heading: '## ✅ Verification & "Works As-Is" Checklist',
+      ask: `From the Guardian: the exact verification steps to prove behavior is unchanged — what to build/run/test before and after each change, which existing tests cover what, and where characterization tests should be added to lock current behavior before refactoring.` },
+    { heading: '## Rollback & Safety Net',
+      ask: `Describe the safety net: small reversible commits, how to roll back each step, and how to detect a behavior regression early.` },
+  ];
+}
+
+/**
+ * Produce a behavior-preserving correction/modernization plan as a large team.
+ *
+ * For a multi-repo project each repo gets a dedicated "Repo Lead" agent (capped),
+ * joined by cross-cutting Integration and Quality analysts and — always — a
+ * Behavior-Preservation Guardian. The team studies everything, debates, the
+ * Guardian locks the invariants, and the plan is synthesised section by section.
+ * NOTHING is edited; the output is guidance constrained to "no business-logic change".
+ *
+ * @returns headings of any sections that failed to generate.
+ */
+export async function streamCorrectionPlan(
+  analysis: RepoAnalysis,
+  onChunk: (chunk: string) => void,
+  cancellationToken: vscode.CancellationToken,
+  onSectionStart: ((index: number, total: number, heading: string) => void) | undefined,
+  callbacks: TeamCallbacks
+): Promise<string[]> {
+  const model = await selectModel();
+  const ds = analysis.detectedStack;
+  const stackLine = `${ds.framework} / ${ds.primaryLanguage}`;
+  const subRepos = analysis.subRepos ?? [];
+  const isMulti = subRepos.length > 1;
+  const scopeLabel = isMulti ? `this ${subRepos.length}-repo project` : `the ${analysis.repoInfo.repo} codebase`;
+
+  // ── Assemble the team ──────────────────────────────────────────────────────
+  let squad: TeamAgent[];
+  if (isMulti) {
+    const capped = subRepos.slice(0, REPO_SQUAD_CAP);
+    squad = capped.map((name) => ({
+      id: `repo-${name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')}`,
+      role: `${name} Repo Lead`,
+      emoji: '📁',
+      focus: `Owns the "${name}" repository`,
+      files: analysis.fileTree.filter((p) => p.startsWith(`${name}/`)).slice(0, 40),
+    }));
+    squad.push({ id: 'integration', role: 'Integration & Contracts Analyst', emoji: '🔗', focus: 'How the repos talk to each other & shared contracts', files: [] });
+    squad.push({ id: 'quality', role: 'Code Quality & Structure Analyst', emoji: '🧹', focus: 'Structure, dead code, duplication across repos', files: [] });
+  } else {
+    const mission =
+      `You are the chief engineer assembling a team to safely correct and modernise a codebase ` +
+      `WITHOUT changing any business logic. Pick 3 to 4 specialist analyst roles tailored to a ` +
+      `${stackLine} project (e.g. "Structure & Modularity Analyst", "Logic & Control-Flow Analyst", ` +
+      `"Code Quality Analyst", "Dependencies & Build Analyst").`;
+    squad = await formTeam(model, analysis, mission, defaultCorrectionTeam, cancellationToken);
+  }
+  squad.push({ ...GUARDIAN });
+
+  const roster = [LEAD_CHIEF, ...squad];
+  callbacks.onTeamFormed(roster);
+  if (cancellationToken.isCancellationRequested) { return []; }
+
+  const noChangeRule =
+    `The ABSOLUTE rule: do NOT change any business logic. Every suggestion must preserve current ` +
+    `behavior exactly — only structure, clarity, dead code, duplication, dependencies and safety may improve.`;
+
+  // Chief opens, stating the mandate
+  await runAgentTurn(
+    model, LEAD_CHIEF,
+    `You are the Chief Engineer kicking off a correction effort for ${scopeLabel} (${stackLine}). ` +
+    `${noChangeRule} Team: ${squad.map((s) => s.role).join(', ')}. In 2-3 sentences, set the mission and ` +
+    `tell each member what to focus on. First person, no markdown headings.`,
+    'analysis', callbacks, cancellationToken
+  );
+  if (cancellationToken.isCancellationRequested) { return []; }
+
+  // ── Round 1: everyone studies their area ───────────────────────────────────
+  const baseContext = buildContext(analysis, 'N/A (behavior-preserving correction)');
+  const round1: Record<string, string> = {};
+  for (const agent of squad) {
+    if (cancellationToken.isCancellationRequested) { return []; }
+    const filesBlock = agent.files.length ? `\nFiles in your area:\n${agent.files.slice(0, 30).join('\n')}\n` : '';
+    const isGuardian = agent.id === GUARDIAN.id;
+    const ask = isGuardian
+      ? `Identify the business-logic INVARIANTS that must not change: key input→output behaviors, public ` +
+        `contracts, side effects and edge cases — referencing real functions/endpoints. Also note where ` +
+        `current behavior is implicit/untested and risky to touch.`
+      : `Study YOUR area and list concrete CORRECTION opportunities (structure, dead code, duplication, ` +
+        `naming, risky patterns) in 4-6 bullets, each with the real file and a SAFE fix that preserves ` +
+        `behavior. Flag anything that looks like it could change behavior if touched carelessly.`;
+    const prompt =
+      `${baseContext}\n\n---\n` +
+      `You are the ${agent.role} (${agent.focus}) on a correction team for ${scopeLabel}. ${noChangeRule}${filesBlock}\n` +
+      `${ask} First person, like in a review. No markdown headings.`;
+    round1[agent.id] = await runAgentTurn(model, agent, prompt, 'analysis', callbacks, cancellationToken);
+  }
+
+  // ── Round 2: cross-team discussion ─────────────────────────────────────────
+  const transcript1 = squad.map((a) => `${a.role}:\n${round1[a.id] || '(no input)'}`).join('\n\n');
+  const round2: Record<string, string> = {};
+  for (const agent of squad) {
+    if (cancellationToken.isCancellationRequested) { break; }
+    const isGuardian = agent.id === GUARDIAN.id;
+    const ask = isGuardian
+      ? `Review the team's proposed corrections and challenge any that could alter behavior. Confirm the ` +
+        `invariants and state the verification steps needed to prove behavior is unchanged.`
+      : `React to teammates: shared root causes, cross-cutting/cross-repo dependencies, the safe ORDER of ` +
+        `changes, and anything the Guardian should watch. Push back if a suggestion risks behavior.`;
+    const prompt =
+      `You are the ${agent.role} on a correction team for ${scopeLabel}. ${noChangeRule}\n` +
+      `Here is round one:\n\n${transcript1}\n\n---\n${ask} 2-4 sentences, first person, address teammates by role. No markdown headings.`;
+    round2[agent.id] = await runAgentTurn(model, agent, prompt, 'discussion', callbacks, cancellationToken);
+  }
+  if (cancellationToken.isCancellationRequested) { return []; }
+
+  // ── Distil and synthesise ──────────────────────────────────────────────────
+  const digest =
+    `─── Correction Team Findings (authoritative — preserve all behavior) ───\n\n` +
+    squad.map((a) =>
+      `### ${a.role} — ${a.focus}\n` +
+      `Findings: ${round1[a.id] || '(none)'}\n` +
+      `Discussion: ${round2[a.id] || '(none)'}`
+    ).join('\n\n');
+
+  callbacks.onDiscussionComplete?.({ agents: squad, digest });
+
+  callbacks.onAgentStart(LEAD_CHIEF, 'synthesis');
+  callbacks.onAgentChunk(LEAD_CHIEF.id,
+    'Aligned, team — writing the behavior-preserving correction plan now, with the invariants locked first.');
+  callbacks.onAgentEnd(LEAD_CHIEF.id);
+
+  const sections = buildCorrectionSections(scopeLabel);
+  const sysPrefix =
+    `You are a principal engineer writing one section of a behavior-preserving correction/modernization ` +
+    `plan for ${scopeLabel}. HARD RULE: never propose a business-logic change — only structural, clarity, ` +
+    `dead-code, duplication, dependency and safety improvements that keep behavior identical. Be concrete, ` +
+    `reference real files/functions from the context, give before/after where useful, and call out the ` +
+    `invariant each change preserves. Never invent file names.`;
+  const minimalPrompt = (heading: string) =>
+    `Write the "${heading}" section of a behavior-preserving correction plan for a ${stackLine} project. ` +
+    `Improve structure/quality only — never change business logic.`;
+
+  return runSectionLoop(
+    model, analysis, 'N/A (behavior-preserving correction)', sections, sysPrefix, minimalPrompt,
+    onChunk, cancellationToken, onSectionStart, digest, false
+  );
+}
+
+/**
+ * Rewrite ONE source file to improve structure/quality while preserving behavior
+ * exactly. Returns the new full content, or null if there is no safe change
+ * (or the file is too large / the response looks unsafe to write).
+ */
+export async function rewriteFilePreservingBehavior(
+  relPath: string,
+  content: string,
+  guidance: string,
+  cancellationToken: vscode.CancellationToken
+): Promise<string | null> {
+  const MAX_CHARS = 24000; // ~6k tokens — beyond this a single-shot rewrite risks truncation
+  if (!content || content.length > MAX_CHARS) { return null; }
+
+  const model = await selectModel();
+  const prompt =
+    `You are refactoring a single source file to improve structure, readability, naming, and to remove ` +
+    `dead code/duplication. ABSOLUTE RULE: do NOT change any business logic or behavior — identical inputs ` +
+    `must produce identical outputs and side effects, and the public API/signatures must stay the same.\n\n` +
+    (guidance ? `Team correction guidance (apply only what is safe and relevant to THIS file):\n${guidance.slice(0, 4000)}\n\n` : '') +
+    `File: ${relPath}\n\`\`\`\n${content}\n\`\`\`\n\n` +
+    `Output ONLY the complete updated file content — no explanation, no markdown fences. ` +
+    `If there is no safe improvement to make, output exactly: NO_CHANGE`;
+
+  let out = '';
+  try {
+    const res = await model.sendRequest([vscode.LanguageModelChatMessage.User(prompt)], {}, cancellationToken);
+    for await (const part of res.text) { out += part; }
+  } catch {
+    return null;
+  }
+
+  let t = out.trim();
+  if (!t || t === 'NO_CHANGE') { return null; }
+  // Strip accidental code fences the model may add
+  if (t.startsWith('```')) {
+    t = t.replace(/^```[a-zA-Z0-9]*\n?/, '').replace(/\n?```\s*$/, '');
+  }
+  // Safety guards: reject suspiciously short output (possible truncation) or no-op
+  if (t.length < content.length * 0.5) { return null; }
+  if (t.trim() === content.trim()) { return null; }
+  return t;
 }
 
 // ─── Single Section Retry ─────────────────────────────────────────────────────
